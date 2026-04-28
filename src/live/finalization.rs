@@ -5,13 +5,18 @@ use crate::beacon_client::types::FinalizedCheckpointEvent;
 use crate::config::EffectiveScanMode;
 use crate::db::Pool as PgPool;
 use crate::db::scanner as db_scanner;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::exits;
 use crate::scanner;
+
+fn is_beacon_request_failure(e: &Error) -> bool {
+    matches!(e, Error::Http(_) | Error::BeaconApi { .. })
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_finalized_rescan(
     client: &BeaconClient,
+    backfill_client: Option<&BeaconClient>,
     pool: &PgPool,
     scan_validators: &HashSet<u64>,
     validator_exits: &HashMap<u64, u64>,
@@ -47,12 +52,32 @@ pub(super) async fn process_finalized_rescan(
         if active.is_empty() {
             continue;
         }
-        scanner::scan_epoch(client, pool, epoch, &active, true, scan_mode)
-            .await
-            .map_err(|e| {
+        match scanner::scan_epoch(client, pool, epoch, &active, true, scan_mode).await {
+            Ok(()) => {}
+            Err(e) if is_beacon_request_failure(&e) && backfill_client.is_some() => {
+                let bf = backfill_client.expect("checked above");
+                tracing::warn!(
+                    epoch,
+                    error = %e,
+                    "Live client failed re-scan; retrying with backfill client"
+                );
+                scanner::scan_epoch(bf, pool, epoch, &active, true, scan_mode)
+                    .await
+                    .map_err(|e2| {
+                        tracing::error!(
+                            epoch,
+                            primary_error = %e,
+                            backfill_error = %e2,
+                            "Backfill client also failed re-scan; aborting"
+                        );
+                        e2
+                    })?;
+            }
+            Err(e) => {
                 tracing::error!(epoch, error = %e, "Failed to re-scan finalized epoch; aborting");
-                e
-            })?;
+                return Err(e);
+            }
+        }
     }
     crate::metrics::LIVE_FINALIZED_RESCAN_DURATION
         .with_label_values(&["rescan_loop"])

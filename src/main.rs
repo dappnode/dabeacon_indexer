@@ -310,8 +310,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // Concurrent mode: live in the foreground, backfill in the background.
         // SSE events are never blocked by the slower historical scan.
+        // Only pass a backfill client to the live loop when it's a *separate*
+        // beacon node — otherwise it's just an Arc clone of the live client
+        // and retrying against it on a finalized-rescan failure is wasted.
+        let live_backfill = config
+            .backfill_beacon_url
+            .as_ref()
+            .map(|_| backfill_client.as_ref());
         let live_result = live::run_live_tracking(
             live_client.as_ref(),
+            live_backfill,
             &pool,
             instance_id,
             &tracked_set,
