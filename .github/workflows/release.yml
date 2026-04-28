@@ -76,7 +76,7 @@ jobs:
 
   build-image:
     needs: detect-version-change
-    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    if: github.event_name == 'workflow_dispatch' || (needs.detect-version-change.outputs.changed == 'true' && needs.detect-version-change.outputs.tag_exists == 'false')
     strategy:
       matrix:
         include:
@@ -132,7 +132,7 @@ jobs:
   merge-images:
     runs-on: ubuntu-latest
     needs: [detect-version-change, build-image]
-    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    if: github.event_name == 'workflow_dispatch' || (needs.detect-version-change.outputs.changed == 'true' && needs.detect-version-change.outputs.tag_exists == 'false')
     env:
       ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
       REPO_NAME: ${{ vars.REPO_NAME }}
@@ -180,7 +180,7 @@ jobs:
 
   create-github-release:
     needs: detect-version-change
-    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    if: github.event_name == 'workflow_dispatch' || (needs.detect-version-change.outputs.changed == 'true' && needs.detect-version-change.outputs.tag_exists == 'false')
     env:
       VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
     strategy:
@@ -263,7 +263,7 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs: [detect-version-change, create-github-release]
-    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    if: github.event_name == 'workflow_dispatch' || (needs.detect-version-change.outputs.changed == 'true' && needs.detect-version-change.outputs.tag_exists == 'false')
     env:
       VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
     steps:
@@ -276,6 +276,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+
+      # Manual reruns (workflow_dispatch) are expected to overwrite any
+      # existing release + tag at this version. Push-driven runs are gated by
+      # detect-version-change to never reach here when the tag exists, so this
+      # is a no-op for them.
+      - name: Delete existing release & tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${VERSION_TAG}" --yes --cleanup-tag --repo "${GITHUB_REPOSITORY}" || true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1

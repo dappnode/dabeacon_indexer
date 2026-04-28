@@ -13,7 +13,7 @@ impl BeaconClient {
     pub async fn get_chain_spec(&self) -> Result<ChainSpec> {
         let (spec, genesis) = tokio::try_join!(
             self.get::<SpecResponse>("/eth/v1/config/spec"),
-            self.get::<GenesisResponse>("/eth/v1/beacon/genesis"),
+            self.get::<GenesisData>("/eth/v1/beacon/genesis"),
         )?;
         Ok(ChainSpec {
             slots_per_epoch: spec.slots_per_epoch,
@@ -22,7 +22,7 @@ impl BeaconClient {
             max_committees_per_slot: spec.max_committees_per_slot,
             altair_fork_epoch: spec.altair_fork_epoch,
             epochs_per_sync_committee_period: spec.epochs_per_sync_committee_period,
-            genesis_time: genesis.data.genesis_time,
+            genesis_time: genesis.genesis_time,
         })
     }
 }
@@ -49,13 +49,6 @@ struct SpecResponse {
         deserialize_with = "deser_u64_string"
     )]
     epochs_per_sync_committee_period: u64,
-}
-
-/// `/eth/v1/beacon/genesis` envelope. Same `{ "data": ... }` shape as the
-/// rest of the beacon API. We only care about `genesis_time`.
-#[derive(Deserialize)]
-struct GenesisResponse {
-    data: GenesisData,
 }
 
 #[derive(Deserialize)]
