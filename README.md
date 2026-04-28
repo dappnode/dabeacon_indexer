@@ -157,7 +157,7 @@ tags = ["pool-a", "node-2"]
 
 | Flag | Default | Behaviour |
 |---|---|---|
-| `--backfill-only` / `BACKFILL_ONLY` | `false` | Run backfill, then exit. No web server, no live tracking. Useful for first-time seed runs against an archive node. |
+| `--mode` / `RUN_MODE` | `both` | Which workloads to run: `live` (head tracking + finality rescans + web server only — no historical backfill), `backfill` (one-shot historical catch-up, no live, no web), or `both`. See [Running modes](#running-modes). |
 | `--max-backfill-depth` / `MAX_BACKFILL_DEPTH` | *(unlimited)* | Clamp the earliest epoch backfill will start from. Protects against accidentally re-scanning from genesis for a newly-added validator. |
 | `--non-contiguous-backfill` / `NON_CONTIGUOUS_BACKFILL` | `false` | Walk every epoch in the backfill range and scan only those (validator, epoch) pairs that don't already have a finalized row. Use after widening validator set or reducing `max_backfill_depth`. |
 | `--scan-mode` / `SCAN_MODE` | `auto` | Attestation scan strategy. `dense` fetches every block in the epoch and derives correctness from attestations vs the canonical chain — amortises well for 30+ validators. `sparse` derives correctness from rewards and scans forward block-by-block only for duties the rewards show were included — ~4–5 API calls per epoch vs ~100 for dense. `auto` resolves to `sparse` when 5 or fewer validators are tracked. See [scan mode semantics](#attestation-scan-modes). |
@@ -173,7 +173,9 @@ tags = ["pool-a", "node-2"]
 
 ## Running modes
 
-### Default: live + backfill concurrently
+Selected via `--mode {live|backfill|both}` (env `RUN_MODE`, default `both`). Every mode is independently selectable; `live` and `backfill` are *not* shorthands for each other.
+
+### `both` — default: live + backfill concurrently
 
 ```bash
 cargo run --release
@@ -181,23 +183,35 @@ cargo run --release
 
 On startup the indexer:
 
-1. Connects to the beacon node, fetches the chain spec.
+1. Connects to the beacon node, fetches the chain spec, seeds validator metadata.
 2. Reads the current finality checkpoint `f₀`.
 3. Spawns a background task that backfills epochs `[…=f₀]` (using the backfill client — archive node if configured).
 4. Runs live head tracking in the foreground, owning epochs `(f₀, ∞)`.
 5. The web server runs from startup with both DB reads and the SSE stream.
+6. A periodic reconcile task re-fetches active validators' state every epoch so exits land in the DB without a process restart.
 
 Live and backfill never touch the same epoch. `finalized=true` rows are immutable; live's `finalized=false` rows get promoted on the next `finalized_checkpoint` event.
 
-### Backfill only
+### `backfill` only
 
 ```bash
-cargo run --release -- --backfill-only
+cargo run --release -- --mode backfill
 ```
 
 Runs the historical backfill until everything up to current finality is covered, then exits. Use this for the first run against an archive node to seed the database.
 
-Omit the web server. Re-extends finality if the chain advances mid-pass.
+No web server, no live tracking. Re-extends finality if the chain advances mid-pass. The validator-state reconcile loop is skipped — backfill processes finalized history where state at any past epoch is fully determined; only the startup seed is needed.
+
+### `live` only
+
+```bash
+cargo run --release -- --mode live
+```
+
+Head tracking + finality rescans + web server, **no** historical backfill. Two situations where this is the right pick:
+
+- **Multi-instance**: historical data is owned by a separate dedicated backfill instance writing to the same Postgres (typical: one head-tracker per validator's local non-archive node, one shared archive backfiller). The indexer assumes the DB is already (or being) populated by another writer for everything up to `f₀` and just owns `(f₀, ∞)`.
+- **No archive client available**: you only have a non-archive beacon node and don't want to run an archive node. Live mode keeps working — but **the DB will only contain data from the moment this instance first started forward**, so any view spanning epochs older than that startup will show gaps. Acceptable for "I just want to track from now on", not for historical analysis.
 
 ### Split archive / non-archive nodes
 
