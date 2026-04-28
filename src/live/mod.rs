@@ -38,7 +38,7 @@ pub async fn run_live_tracking(
 
     let start_slot = epoch_start_slot(last_backfilled_epoch) + chain::slots_per_epoch() - 1;
     let mut last_scanned_slot: Option<u64> = Some(start_slot);
-    let mut last_finalized_rescanned_epoch = last_backfilled_epoch.saturating_sub(1);
+    let mut last_finalized_rescanned_epoch = last_backfilled_epoch;
     tracing::info!(
         last_backfilled_epoch,
         start_slot,

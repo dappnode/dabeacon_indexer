@@ -96,9 +96,11 @@ pub struct CliConfig {
     #[arg(long, env = "API_KEY", default_value = "")]
     pub api_key: String,
 
-    /// Run backfill and exit without starting live tracking or web server
-    #[arg(long, env = "BACKFILL_ONLY", default_value_t = false)]
-    pub backfill_only: bool,
+    /// Which workloads to run: `live` (head tracking + finality rescans + web
+    /// server only), `backfill` (historical catch-up only, no live, no web),
+    /// or `both` (default — live in the foreground, backfill in the background).
+    #[arg(long, env = "RUN_MODE", default_value = "both")]
+    pub mode: String,
 
     /// Earliest epoch the backfill is allowed to start from. Validators whose
     /// activation (or last_scanned+1) is older than this are clamped to this
@@ -117,6 +119,41 @@ pub struct CliConfig {
     /// ≤5 validators tracked, else dense).
     #[arg(long, env = "SCAN_MODE", default_value = "auto")]
     pub scan_mode: String,
+}
+
+/// Which background workloads the process runs. Symmetric — every mode is
+/// independently selectable; `Both` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum RunMode {
+    /// Live head tracking + finality rescans + web server. No historical
+    /// backfill — useful when historical data is owned by a separate
+    /// dedicated backfill instance writing to the same DB.
+    Live,
+    /// One-shot historical backfill, no live tracking and no web server.
+    /// Suitable for the initial seed run against an archive node.
+    Backfill,
+    /// Live in the foreground, a one-pass backfill in the background.
+    /// Default for typical single-instance deployments.
+    Both,
+}
+
+impl RunMode {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "live" => Ok(Self::Live),
+            "backfill" => Ok(Self::Backfill),
+            "both" => Ok(Self::Both),
+            other => anyhow::bail!("invalid run mode '{other}': expected live | backfill | both"),
+        }
+    }
+
+    pub fn runs_live(&self) -> bool {
+        matches!(self, Self::Live | Self::Both)
+    }
+
+    pub fn runs_backfill(&self) -> bool {
+        matches!(self, Self::Backfill | Self::Both)
+    }
 }
 
 /// TOML config file structure
@@ -177,7 +214,7 @@ pub struct Config {
     pub web_port: u16,
     pub metrics_port: u16,
     pub api_key: String,
-    pub backfill_only: bool,
+    pub mode: RunMode,
     pub max_backfill_depth: Option<u64>,
     pub non_contiguous_backfill: bool,
     pub scan_mode: ScanMode,
@@ -259,6 +296,8 @@ impl Config {
         };
         let scan_mode = ScanMode::parse(&scan_mode_str)?;
 
+        let mode = RunMode::parse(&cli.mode)?;
+
         Ok(Config {
             beacon_url,
             backfill_beacon_url,
@@ -266,7 +305,7 @@ impl Config {
             web_port: cli.web_port,
             metrics_port: cli.metrics_port,
             api_key,
-            backfill_only: cli.backfill_only,
+            mode,
             max_backfill_depth,
             non_contiguous_backfill,
             scan_mode,
