@@ -25,6 +25,7 @@ use reorg::process_chain_reorg;
 #[allow(clippy::too_many_arguments)]
 pub async fn run_live_tracking(
     client: &BeaconClient,
+    backfill_client: Option<&BeaconClient>,
     pool: &PgPool,
     instance_id: Uuid,
     tracked: &HashSet<u64>,
@@ -114,6 +115,7 @@ pub async fn run_live_tracking(
                                         .inc();
                                     process_finalized_rescan(
                                         client,
+                                        backfill_client,
                                         pool,
                                         &scan_validators,
                                         validator_exits,
