@@ -22,6 +22,7 @@ pub struct ChainSpec {
     pub max_committees_per_slot: u64,
     pub altair_fork_epoch: u64,
     pub epochs_per_sync_committee_period: u64,
+    pub genesis_time: u64,
 }
 
 impl ChainSpec {
@@ -36,6 +37,7 @@ impl ChainSpec {
         max_committees_per_slot: 64,
         altair_fork_epoch: 74_240,
         epochs_per_sync_committee_period: 256,
+        genesis_time: 1_606_824_023,
     };
 
     pub const fn epochs_per_day(&self) -> u64 {

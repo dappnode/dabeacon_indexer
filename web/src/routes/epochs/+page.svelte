@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getEpochs, getStats, getValidators, getMeta, pct, eth, epochTime, timeAgo, type EpochRow, type Paginated, type ValidatorSummary, type MetaResponse, type Stats } from '$lib/api';
+	import { getEpochs, getStats, getValidators, getMeta, pct, eth, epochTime, timeAgo, slotsPerEpoch, type EpochRow, type Paginated, type ValidatorSummary, type MetaResponse, type Stats } from '$lib/api';
 	import ValidatorPicker from '$lib/ValidatorPicker.svelte';
 	import RangeInput from '$lib/RangeInput.svelte';
 	import { cardSurface, tableSurface, tableHeaderRow, tableBodyRow, healthTier, tierText } from '$lib/ui';
@@ -119,7 +119,7 @@
 					{@const rowTier = healthTier(r.attestation_rate)}
 					<tr class="{tableBodyRow} {r.missed > 0 || r.proposals_missed > 0 ? 'bg-red-950/20' : ''}">
 						<td class="px-3 py-1.5 font-mono">{r.epoch}</td>
-						<td class="px-3 py-1.5 text-xs text-gray-400" title={epochTime(r.epoch)}>{timeAgo(r.epoch * 32)}</td>
+						<td class="px-3 py-1.5 text-xs text-gray-400" title={epochTime(r.epoch)}>{timeAgo(r.epoch * slotsPerEpoch())}</td>
 						<td class="px-3 py-1.5 text-right">{r.total_duties}</td>
 						<td class="px-3 py-1.5 text-right text-green-400">{r.included}</td>
 						<td class="px-3 py-1.5 text-right" class:text-red-400={r.missed > 0}>{r.missed}</td>

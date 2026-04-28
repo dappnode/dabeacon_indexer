@@ -1,9 +1,10 @@
 const BASE = '/api';
 
-// Mainnet beacon chain genesis: Dec 1, 2020 12:00:23 UTC
-const GENESIS_TIME = 1606824023;
-const SECONDS_PER_SLOT = 12;
-const SLOTS_PER_EPOCH = 32;
+let chainConfig = {
+	genesis_time: 1606824023,
+	seconds_per_slot: 12,
+	slots_per_epoch: 32,
+};
 
 export function getApiKey(): string {
 	return localStorage.getItem('api_key') || '';
@@ -55,12 +56,33 @@ export interface ValidatorMetaEntry {
 	tags: string[];
 }
 
+export interface ChainInfo {
+	slots_per_epoch: number;
+	seconds_per_slot: number;
+	genesis_time: number;
+}
+
 export interface MetaResponse {
 	validators: Record<string, ValidatorMetaEntry>;
 	all_tags: string[];
+	chain?: ChainInfo;
 }
 
-export const getMeta = () => fetchJson<MetaResponse>(`${BASE}/meta`);
+export async function getMeta(): Promise<MetaResponse> {
+	const meta = await fetchJson<MetaResponse>(`${BASE}/meta`);
+	if (meta.chain) {
+		chainConfig = meta.chain;
+	}
+	return meta;
+}
+
+export function getChainConfig(): ChainInfo {
+	return chainConfig;
+}
+
+export function slotsPerEpoch(): number {
+	return chainConfig.slots_per_epoch;
+}
 
 export interface Stats {
 	total_validators: number;
@@ -222,18 +244,18 @@ export function eth(n: number | null, decimals = 6): string {
 
 /** Convert a slot number to a UTC timestamp string */
 export function slotTime(slot: number): string {
-	const ts = GENESIS_TIME + slot * SECONDS_PER_SLOT;
+	const ts = chainConfig.genesis_time + slot * chainConfig.seconds_per_slot;
 	return new Date(ts * 1000).toISOString().replace('T', ' ').replace('.000Z', ' UTC');
 }
 
 /** Convert an epoch number to a UTC timestamp string (start of epoch) */
 export function epochTime(epoch: number): string {
-	return slotTime(epoch * SLOTS_PER_EPOCH);
+	return slotTime(epoch * chainConfig.slots_per_epoch);
 }
 
 /** Shorter relative time: "2m ago", "3h ago", "5d ago" */
 export function timeAgo(slot: number): string {
-	const ts = GENESIS_TIME + slot * SECONDS_PER_SLOT;
+	const ts = chainConfig.genesis_time + slot * chainConfig.seconds_per_slot;
 	const diff = Math.floor(Date.now() / 1000) - ts;
 	return `${formatDuration(diff)} ago`;
 }
