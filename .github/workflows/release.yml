@@ -1,0 +1,271 @@
+name: Release (on Cargo.toml version change)
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: read
+
+on:
+  # Run automatically when Cargo.toml changes on master
+  push:
+    branches: [master]
+    paths:
+      - Cargo.toml
+  # Allow manual trigger anytime
+  workflow_dispatch:
+
+jobs:
+  detect-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      changed: ${{ steps.compare.outputs.changed }}
+      tag_exists: ${{ steps.compare.outputs.tag_exists }}
+    steps:
+      - name: Checkout (fetch previous commit & tags)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Read current version from Cargo.toml
+        id: read
+        shell: bash
+        run: |
+          CURR_VER=$(grep -m1 '^\s*version\s*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$CURR_VER" ]; then
+            echo "Could not parse version from Cargo.toml"; exit 1
+          fi
+          echo "version=v${CURR_VER}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: v${CURR_VER}"
+
+      - name: Compare with previous commit & tags
+        id: compare
+        shell: bash
+        run: |
+          set -e
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            PREV_LINE=$(git show HEAD^:Cargo.toml 2>/dev/null | grep -m1 '^\s*version\s*=' || true)
+          else
+            PREV_LINE=""
+          fi
+          PREV_VER=$(echo "$PREV_LINE" | sed -E 's/.*"([^"]+)".*/\1/')
+          CURR="${{ steps.read.outputs.version }}"
+
+          if [ -z "$PREV_VER" ]; then
+            CHANGED=true
+          elif [ "v${PREV_VER}" = "$CURR" ]; then
+            CHANGED=false
+          else
+            CHANGED=true
+          fi
+
+          git fetch --tags --force --prune
+          if git tag -l | grep -qx "$CURR"; then
+            TAG_EXISTS=true
+          else
+            TAG_EXISTS=false
+          fi
+
+          echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "tag_exists=${TAG_EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "Previous: v${PREV_VER:-<none>}, Current: $CURR, Changed: $CHANGED, Tag exists: $TAG_EXISTS"
+
+  build-image:
+    needs: detect-version-change
+    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      REPO_NAME: ${{ vars.REPO_NAME }}
+      VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push arch-specific image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.REPO_NAME }}:${{ env.VERSION_TAG }}-${{ matrix.arch }}
+          provenance: false
+
+  merge-images:
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, build-image]
+    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    env:
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      REPO_NAME: ${{ vars.REPO_NAME }}
+      VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create and push multi-arch manifest
+        shell: bash
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          IMG="${ECR_REGISTRY}/${REPO_NAME}"
+
+          docker manifest create "${IMG}:${VERSION_TAG}" \
+            "${IMG}:${VERSION_TAG}-amd64" \
+            "${IMG}:${VERSION_TAG}-arm64"
+          docker manifest push "${IMG}:${VERSION_TAG}"
+
+          if [ "$BRANCH" = "master" ]; then
+            docker manifest create "${IMG}:latest" \
+              "${IMG}:${VERSION_TAG}-amd64" \
+              "${IMG}:${VERSION_TAG}-arm64"
+            docker manifest push "${IMG}:latest"
+          fi
+
+  create-github-release:
+    needs: detect-version-change
+    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    env:
+      VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact-name: dabeacon_indexer-x86_64-unknown-linux-gnu
+
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact-name: dabeacon_indexer-aarch64-unknown-linux-gnu
+
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact-name: dabeacon_indexer-x86_64-unknown-linux-musl
+
+          - os: macos-14
+            target: x86_64-apple-darwin
+            artifact-name: dabeacon_indexer-x86_64-apple-darwin
+
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact-name: dabeacon_indexer-aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies for Linux targets
+        if: runner.os == 'Linux' && contains(matrix.target, '-unknown-linux-')
+        run: |
+          if [[ "${{ matrix.target }}" == *"-musl" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+          fi
+          if [[ "${{ matrix.target }}" == "aarch64-"* ]]; then
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Setup linker for AArch64 Linux
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Install common Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/dabeacon_indexer release/
+          cp config.example.toml release/config.example.toml
+          ARCHIVE_NAME="${{ matrix.artifact-name }}-${{ env.VERSION_TAG }}.tar.gz"
+          tar -czf "$ARCHIVE_NAME" -C release .
+          echo "Created archive: $ARCHIVE_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.artifact-name }}-${{ env.VERSION_TAG }}.tar.gz
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [detect-version-change, create-github-release]
+    if: (github.event_name == 'workflow_dispatch' || needs.detect-version-change.outputs.changed == 'true') && needs.detect-version-change.outputs.tag_exists == 'false'
+    env:
+      VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: Release ${{ env.VERSION_TAG }}
+          body: |
+            ## dabeacon_indexer ${{ env.VERSION_TAG }}
+
+            A Ethereum beacon chain indexer with live validator duty tracking.
+
+            ## Supported Platforms
+            - Linux x86_64 (GNU and musl)
+            - Linux ARM64
+            - macOS x86_64
+            - macOS ARM64 (Apple Silicon)
+
+            ## Quick Start
+            1. Download the binary for your platform
+            2. Extract: `tar -xzf dabeacon_indexer-${{ env.VERSION_TAG }}-<target>.tar.gz`
+            3. Copy and edit config: `cp config.example.toml config.toml`
+            4. Run: `./dabeacon_indexer --config config.toml`
+          files: |
+            dabeacon_indexer-*-${{ env.VERSION_TAG }}.tar.gz
+          draft: false
+          prerelease: false

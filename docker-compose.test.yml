@@ -1,0 +1,20 @@
+services:
+  db_test:
+    image: postgres:17
+    container_name: dabeacon_db_test
+    ports:
+      - "5433:5432"   # host 5433 to avoid collision with dev DB on 5432
+    environment:
+      POSTGRES_DB: dabeacon_test
+      POSTGRES_USER: dabeacon
+      POSTGRES_PASSWORD: dabeacon
+    # tmpfs → state lives in RAM, blown away on container stop. Each test
+    # run starts from a clean slate; migrations are reapplied by
+    # `db::connect` when the scanner connects.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dabeacon -d dabeacon_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

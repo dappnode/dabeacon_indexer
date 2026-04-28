@@ -1,0 +1,23 @@
+# Beacon node URL (optional if set via --beacon-url or BEACON_URL)
+# beacon_url = "http://localhost:5052"
+
+# PostgreSQL connection string (optional if set via --database-url or DATABASE_URL)
+# database_url = "postgres://user:pass@localhost:5432/dbname"
+
+# API key for web UI authentication (empty or omit to disable auth)
+# api_key = "my-secret-key"
+
+# Validator entries with tags
+# Tags can be used to group validators in the UI
+
+[[validators]]
+index = 123
+tags = ["pool-a", "node-1"]
+
+[[validators]]
+index = 456
+tags = ["pool-a", "node-2"]
+
+[[validators]]
+index = 789
+tags = ["pool-b", "node-1"]

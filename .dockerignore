@@ -1,0 +1,9 @@
+target/
+web/node_modules/
+web/.svelte-kit/
+web/build/
+*.md
+.git/
+.gitignore
+docker-compose.yml
+config.toml
