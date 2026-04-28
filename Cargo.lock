@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "dabeacon_indexer"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
