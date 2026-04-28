@@ -84,6 +84,30 @@ export function slotsPerEpoch(): number {
 	return chainConfig.slots_per_epoch;
 }
 
+/**
+ * Current beacon-chain epoch derived from wall-clock + chain config.
+ * Used for active/exiting/exited classification of validators in the UI;
+ * mirrors the server-side `active_validators_at` SQL predicate
+ * (`exit_epoch > current_epoch`).
+ */
+export function currentEpoch(): number {
+	const now = Math.floor(Date.now() / 1000);
+	const slot = Math.floor((now - chainConfig.genesis_time) / chainConfig.seconds_per_slot);
+	return Math.floor(slot / chainConfig.slots_per_epoch);
+}
+
+/**
+ * Validator lifecycle status derived from `exit_epoch`:
+ *  - `active`   : exit_epoch is null (still active indefinitely)
+ *  - `exiting`  : exit_epoch is set but not yet reached — still attesting
+ *  - `exited`   : exit_epoch <= current_epoch — no longer attesting
+ */
+export type ValidatorStatus = 'active' | 'exiting' | 'exited';
+export function validatorStatus(exit_epoch: number | null): ValidatorStatus {
+	if (exit_epoch == null) return 'active';
+	return exit_epoch > currentEpoch() ? 'exiting' : 'exited';
+}
+
 export interface Stats {
 	total_validators: number;
 	total_epochs_scanned: number;

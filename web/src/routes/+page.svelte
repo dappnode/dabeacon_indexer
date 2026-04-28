@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getStats, getValidators, getMeta, pct, beaconchainUrl, epochTime, type Stats, type ValidatorSummary, type MetaResponse } from '$lib/api';
+	import { getStats, getValidators, getMeta, pct, beaconchainUrl, epochTime, validatorStatus, type Stats, type ValidatorSummary, type MetaResponse } from '$lib/api';
 	import {
 		cardSurface, tableSurface, tableHeaderRow, tableBodyRow,
 		sectionHeader, sectionDivider,
@@ -181,6 +181,7 @@
 			<tbody>
 				{#each validators as v}
 					{@const vTier = healthTier(v.attestation_rate)}
+					{@const vStatus = validatorStatus(v.exit_epoch)}
 					<tr class={tableBodyRow}>
 						<td class="px-2 py-2"><span class="inline-block w-2 h-2 rounded-full {tierDot[vTier]}" title="Attestation rate {pct(v.attestation_rate)}"></span></td>
 						<td class="px-3 py-2 font-mono"><a href={beaconchainUrl(v.validator_index)} target="_blank" rel="noopener" class="text-blue-400 hover:underline">{v.validator_index}</a></td>
@@ -194,8 +195,10 @@
 						<td class="px-3 py-2 text-right">{v.total_proposals}{#if v.missed_proposals > 0} <span class="text-red-400">({v.missed_proposals} missed)</span>{/if}</td>
 						<td class="px-3 py-2 text-right">{v.sync_participated}{#if v.sync_missed > 0} <span class="text-red-400">/{v.sync_missed}</span>{/if}</td>
 						<td class="px-3 py-2 text-right">
-							{#if v.exit_epoch == null}
+							{#if vStatus === 'active'}
 								<span class="inline-block text-[10px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-300">Active</span>
+							{:else if vStatus === 'exiting'}
+								<span class="inline-block text-[10px] px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-300" title="exit_epoch {v.exit_epoch} — still attesting until then">Exiting</span>
 							{:else}
 								<span class="inline-block text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400" title="exit_epoch {v.exit_epoch}">Exited</span>
 							{/if}
