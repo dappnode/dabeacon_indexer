@@ -1,14 +1,40 @@
 //! Validator-table writes + scanner-internal reads.
 
+use std::collections::HashSet;
+
 use sqlx::Row;
 
 use crate::db::Pool;
 use crate::error::Result;
 
+/// Subset of `tracked` that is active at `epoch`, per the `validators` table:
+/// `activation_epoch <= epoch < COALESCE(exit_epoch, +∞)`. The query is the
+/// single source of truth for active-at-epoch checks across live + backfill;
+/// startup refreshes the underlying rows from the beacon node so this stays
+/// honest as activations / exits happen.
+pub async fn active_validators_at(
+    pool: &Pool,
+    tracked: &[i64],
+    epoch: i64,
+) -> Result<HashSet<u64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        r#"
+        SELECT validator_index FROM validators
+        WHERE validator_index = ANY($1)
+          AND activation_epoch <= $2
+          AND (exit_epoch IS NULL OR exit_epoch > $2)
+        "#,
+    )
+    .bind(tracked)
+    .bind(epoch)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|i| i as u64).collect())
+}
+
 pub struct ValidatorRow {
     pub validator_index: i64,
     pub activation_epoch: i64,
-    pub exit_epoch: Option<i64>,
     pub last_scanned_epoch: Option<i64>,
 }
 
@@ -41,20 +67,17 @@ pub async fn upsert_validator(
     Ok(())
 }
 
-/// Load all tracked validators from the DB.
 pub async fn get_all_validators(pool: &Pool) -> Result<Vec<ValidatorRow>> {
-    let rows = sqlx::query(
-        "SELECT validator_index, activation_epoch, exit_epoch, last_scanned_epoch FROM validators",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT validator_index, activation_epoch, last_scanned_epoch FROM validators")
+            .fetch_all(pool)
+            .await?;
 
     Ok(rows
         .iter()
         .map(|r| ValidatorRow {
             validator_index: r.get("validator_index"),
             activation_epoch: r.get("activation_epoch"),
-            exit_epoch: r.get("exit_epoch"),
             last_scanned_epoch: r.get("last_scanned_epoch"),
         })
         .collect())

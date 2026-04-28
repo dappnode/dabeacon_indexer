@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::beacon_client::BeaconClient;
 use crate::beacon_client::types::FinalizedCheckpointEvent;
@@ -6,15 +6,12 @@ use crate::config::EffectiveScanMode;
 use crate::db::Pool as PgPool;
 use crate::db::scanner as db_scanner;
 use crate::error::Result;
-use crate::exits;
 use crate::scanner;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn process_finalized_rescan(
     client: &BeaconClient,
     pool: &PgPool,
     scan_validators: &HashSet<u64>,
-    validator_exits: &HashMap<u64, u64>,
     scan_mode: EffectiveScanMode,
     finalized: &FinalizedCheckpointEvent,
     last_finalized_rescanned_epoch: &mut u64,
@@ -41,9 +38,13 @@ pub(super) async fn process_finalized_rescan(
         "Catching up finalized rescans"
     );
 
+    let tracked_indices: Vec<i64> = scan_validators.iter().map(|&v| v as i64).collect();
+
     let rescan_started_at = std::time::Instant::now();
     for epoch in from_epoch..=finalized.epoch {
-        let active = exits::active_at(scan_validators, validator_exits, epoch);
+        let active =
+            db_scanner::validators::active_validators_at(pool, &tracked_indices, epoch as i64)
+                .await?;
         if active.is_empty() {
             continue;
         }
@@ -75,11 +76,15 @@ pub(super) async fn process_finalized_rescan(
 
     // Only advance watermarks for validators still active at the finalized
     // epoch — exited ones have nothing to scan past their exit.
-    let indices: Vec<i64> = scan_validators
-        .iter()
-        .filter(|&&v| exits::is_active_at(validator_exits, v, finalized.epoch))
-        .map(|&v| v as i64)
-        .collect();
+    let indices: Vec<i64> = db_scanner::validators::active_validators_at(
+        pool,
+        &tracked_indices,
+        finalized.epoch as i64,
+    )
+    .await?
+    .into_iter()
+    .map(|v| v as i64)
+    .collect();
     db_scanner::validators::update_validators_scanned_epoch(pool, &indices, finalized.epoch as i64)
         .await
         .map_err(|e| {

@@ -7,8 +7,8 @@ use crate::beacon_client::BeaconClient;
 use crate::beacon_client::types::HeadEvent;
 use crate::beacon_client::types::{BlockRoot, SignedBeaconBlock};
 use crate::chain::slot_to_epoch;
+use crate::db::scanner as db_scanner;
 use crate::error::Result;
-use crate::exits;
 use crate::scanner;
 
 const BLOCK_FETCH_RETRIES: u32 = 3;
@@ -19,7 +19,6 @@ pub(super) async fn process_head_scan(
     client: &BeaconClient,
     pool: &PgPool,
     scan_validators: &HashSet<u64>,
-    validator_exits: &HashMap<u64, u64>,
     head: &HeadEvent,
     last_scanned_slot: &mut Option<u64>,
 ) -> Result<()> {
@@ -42,18 +41,24 @@ pub(super) async fn process_head_scan(
     }
 
     let blocks_by_slot = resolve_chain(client, head, scan_start_slot).await?;
+    let tracked_indices: Vec<i64> = scan_validators.iter().map(|&v| v as i64).collect();
 
-    // Fetch per-epoch duties up front so each slot becomes a pure map lookup.
-    // Already filtered to validators active at each epoch — exited validators
-    // produce no proposer/sync rows.
-    let duties = fetch_epoch_duties(
-        client,
-        scan_validators,
-        validator_exits,
-        scan_start_slot,
-        head.slot,
-    )
-    .await?;
+    let duties =
+        fetch_epoch_duties(client, pool, &tracked_indices, scan_start_slot, head.slot).await?;
+
+    let mut active_by_epoch: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for slot in scan_start_slot..=head.slot {
+        if slot == 0 {
+            continue;
+        }
+        let epoch = slot_to_epoch(slot - 1);
+        if let std::collections::hash_map::Entry::Vacant(e) = active_by_epoch.entry(epoch) {
+            e.insert(
+                db_scanner::validators::active_validators_at(pool, &tracked_indices, epoch as i64)
+                    .await?,
+            );
+        }
+    }
 
     for slot in scan_start_slot..=head.slot {
         if slot == 0 {
@@ -67,16 +72,11 @@ pub(super) async fn process_head_scan(
 
         let block = blocks_by_slot.get(&slot);
         if let Some(block) = block {
-            let active = exits::active_at(scan_validators, validator_exits, epoch);
+            let active = &active_by_epoch[&epoch];
             if !active.is_empty()
-                && let Err(e) = scanner::scan_live_attestations_in_slot(
-                    client,
-                    pool,
-                    slot,
-                    &active,
-                    Some(block),
-                )
-                .await
+                && let Err(e) =
+                    scanner::scan_live_attestations_in_slot(client, pool, slot, active, Some(block))
+                        .await
             {
                 tracing::error!(slot, epoch, error = %e, "Live attestation scan failed; aborting");
                 return Err(e);
@@ -122,8 +122,8 @@ struct EpochDuties {
 
 async fn fetch_epoch_duties(
     client: &BeaconClient,
-    scan_validators: &HashSet<u64>,
-    validator_exits: &HashMap<u64, u64>,
+    pool: &PgPool,
+    tracked_indices: &[i64],
     scan_start_slot: u64,
     head_slot: u64,
 ) -> Result<EpochDuties> {
@@ -138,7 +138,9 @@ async fn fetch_epoch_duties(
     let mut sync_positions_by_epoch: HashMap<u64, HashMap<u64, Vec<u64>>> = HashMap::new();
 
     for epoch in epochs {
-        let active = exits::active_at(scan_validators, validator_exits, epoch);
+        let active =
+            db_scanner::validators::active_validators_at(pool, tracked_indices, epoch as i64)
+                .await?;
         if active.is_empty() {
             continue;
         }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::db::Pool as PgPool;
 use futures::StreamExt;
@@ -22,13 +22,11 @@ use finalization::process_finalized_rescan;
 use head::process_head_scan;
 use reorg::process_chain_reorg;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_live_tracking(
     client: &BeaconClient,
     pool: &PgPool,
     instance_id: Uuid,
     tracked: &HashSet<u64>,
-    validator_exits: &HashMap<u64, u64>,
     scan_mode: EffectiveScanMode,
     live_updates_tx: broadcast::Sender<LiveUpdateEvent>,
     last_backfilled_epoch: u64,
@@ -72,7 +70,6 @@ pub async fn run_live_tracking(
                                     client,
                                     pool,
                                     &scan_validators,
-                                    validator_exits,
                                     &head,
                                     &mut last_scanned_slot,
                                 )
@@ -116,7 +113,6 @@ pub async fn run_live_tracking(
                                         client,
                                         pool,
                                         &scan_validators,
-                                        validator_exits,
                                         scan_mode,
                                         &finalized,
                                         &mut last_finalized_rescanned_epoch,

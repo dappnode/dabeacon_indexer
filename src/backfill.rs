@@ -23,11 +23,10 @@ use crate::scanner;
 
 /// Earliest epoch the backfill task will try to scan given the current
 /// validator watermarks and config. Returns `None` if the scan state is
-/// empty or every tracked validator has already exited before its start
-/// epoch (nothing to backfill).
+/// empty (nothing tracked).
 pub fn earliest_epoch_to_scan(
     config: &Config,
-    validator_scan_state: &HashMap<u64, (u64, Option<u64>, Option<u64>)>,
+    validator_scan_state: &HashMap<u64, (u64, Option<u64>)>,
 ) -> Option<u64> {
     let non_contig = config.non_contiguous_backfill;
     let compute_start = |activation: u64, last_scanned: Option<u64>| -> u64 {
@@ -40,13 +39,7 @@ pub fn earliest_epoch_to_scan(
     };
     validator_scan_state
         .values()
-        .filter_map(|(act, ls, exit)| {
-            let start = compute_start(*act, *ls);
-            match exit {
-                Some(e) if start >= *e => None,
-                _ => Some(start),
-            }
-        })
+        .map(|(act, ls)| compute_start(*act, *ls))
         .min()
 }
 
@@ -88,7 +81,7 @@ pub async fn run_backfill(
     client: &BeaconClient,
     pool: &PgPool,
     config: &Config,
-    mut validator_scan_state: HashMap<u64, (u64, Option<u64>, Option<u64>)>,
+    mut validator_scan_state: HashMap<u64, (u64, Option<u64>)>,
     initial_target_epoch: u64,
     instance_id: Uuid,
     live_updates_tx: broadcast::Sender<LiveUpdateEvent>,
@@ -138,13 +131,7 @@ pub async fn run_backfill(
 
         let min_start = validator_scan_state
             .values()
-            .filter_map(|(activation, last_scanned, exit)| {
-                let start = compute_start(*activation, *last_scanned);
-                match exit {
-                    Some(e) if start >= *e => None,
-                    _ => Some(start),
-                }
-            })
+            .map(|(activation, last_scanned)| compute_start(*activation, *last_scanned))
             .min()
             .unwrap_or(target_finalized_epoch + 1);
 
@@ -165,16 +152,21 @@ pub async fn run_backfill(
         let mut epochs_scanned: u64 = 0;
         let mut epochs_skipped_covered: u64 = 0;
 
+        let tracked_indices: Vec<i64> = validator_scan_state.keys().map(|&v| v as i64).collect();
+
         for epoch in min_start..=target_finalized_epoch {
-            let candidates: HashSet<u64> = validator_scan_state
-                .iter()
-                .filter_map(|(idx, (activation, last_scanned, exit))| {
-                    // Skip validators already exited at `epoch` — scanning them would
-                    // only record misses.
-                    if exit.is_some_and(|e| epoch >= e) {
-                        return None;
-                    }
-                    (epoch >= compute_start(*activation, *last_scanned)).then_some(*idx)
+            let active =
+                db::scanner::validators::active_validators_at(pool, &tracked_indices, epoch as i64)
+                    .await?;
+
+            let candidates: HashSet<u64> = active
+                .into_iter()
+                .filter(|idx| {
+                    validator_scan_state
+                        .get(idx)
+                        .is_some_and(|(activation, last_scanned)| {
+                            epoch >= compute_start(*activation, *last_scanned)
+                        })
                 })
                 .collect();
 
@@ -233,7 +225,7 @@ pub async fn run_backfill(
             )
             .await?;
             for idx in &scan_validators {
-                if let Some((_, last_scanned, _)) = validator_scan_state.get_mut(idx) {
+                if let Some((_, last_scanned)) = validator_scan_state.get_mut(idx) {
                     *last_scanned = Some(last_scanned.map_or(epoch, |prev| prev.max(epoch)));
                 }
             }
@@ -273,16 +265,15 @@ pub async fn run_backfill(
 
         if this_pass_non_contiguous {
             // The sweep verified every (validator, epoch) pair up to the target.
-            // Advance last_scanned for active validators so the next (contiguous)
-            // pass resumes from target + 1.
-            let active_ids: Vec<i64> = validator_scan_state
-                .iter()
-                .filter(|(_, (activation, _, exit))| {
-                    *activation <= target_finalized_epoch
-                        && exit.is_none_or(|e| target_finalized_epoch < e)
-                })
-                .map(|(&idx, _)| idx as i64)
-                .collect();
+            // Advance last_scanned for validators active at the target epoch so
+            // the next (contiguous) pass resumes from target + 1.
+            let active_at_target = db::scanner::validators::active_validators_at(
+                pool,
+                &tracked_indices,
+                target_finalized_epoch as i64,
+            )
+            .await?;
+            let active_ids: Vec<i64> = active_at_target.iter().map(|&v| v as i64).collect();
             if !active_ids.is_empty() {
                 db::scanner::validators::update_validators_scanned_epoch(
                     pool,
@@ -291,10 +282,8 @@ pub async fn run_backfill(
                 )
                 .await?;
             }
-            for (_, (activation, last_scanned, exit)) in validator_scan_state.iter_mut() {
-                if *activation <= target_finalized_epoch
-                    && exit.is_none_or(|e| target_finalized_epoch < e)
-                {
+            for idx in &active_at_target {
+                if let Some((_, last_scanned)) = validator_scan_state.get_mut(idx) {
                     *last_scanned = Some(
                         last_scanned
                             .map_or(target_finalized_epoch, |ls| ls.max(target_finalized_epoch)),

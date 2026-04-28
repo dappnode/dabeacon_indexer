@@ -4,11 +4,11 @@ mod chain;
 mod config;
 mod db;
 mod error;
-mod exits;
 mod live;
 mod live_updates;
 mod metrics;
 mod scanner;
+mod validators_update;
 mod web;
 
 use crate::live_updates::LiveUpdateEvent;
@@ -127,63 +127,37 @@ async fn main() -> anyhow::Result<()> {
     );
 
     db::scanner::instance::register_instance(&pool, instance_id).await?;
+    validators_update::update(&live_client, &pool, &validator_indices).await?;
 
-    let beacon_validators = live_client
-        .get_validators("head", &validator_indices)
-        .await?;
-    tracing::debug!(fetched = beacon_validators.len(), "Got validator metadata");
+    tracing::debug!(count = validator_indices.len(), "Seeded validator metadata");
 
-    for v in &beacon_validators {
-        let pubkey_bytes =
-            hex::decode(v.validator.pubkey.trim_start_matches("0x")).unwrap_or_default();
-        let exit_epoch = if v.validator.exit_epoch == u64::MAX {
-            None
-        } else {
-            Some(v.validator.exit_epoch as i64)
-        };
-
-        db::scanner::validators::upsert_validator(
-            &pool,
-            v.index as i64,
-            &pubkey_bytes,
-            v.validator.activation_epoch as i64,
-            exit_epoch,
-        )
-        .await?;
+    if config.mode.runs_live() {
+        let client = live_client.clone();
+        let pool = pool.clone();
+        let tracked = tracked_validators.clone();
+        tokio::spawn(async move {
+            validators_update::run_update_loop(client, pool, tracked).await;
+        });
     }
 
     let db_validators = db::scanner::validators::get_all_validators(&pool).await?;
     let tracked_set: HashSet<u64> = validator_indices.iter().copied().collect();
-    let mut validator_scan_state: HashMap<u64, (u64, Option<u64>, Option<u64>)> = HashMap::new();
-    let mut validator_exits: HashMap<u64, u64> = HashMap::new();
+    let mut validator_scan_state: HashMap<u64, (u64, Option<u64>)> = HashMap::new();
     for v in &db_validators {
         if tracked_set.contains(&(v.validator_index as u64)) {
-            let idx = v.validator_index as u64;
-            let exit = v.exit_epoch.map(|e| e as u64);
             validator_scan_state.insert(
-                idx,
+                v.validator_index as u64,
                 (
                     v.activation_epoch as u64,
                     v.last_scanned_epoch.map(|e| e as u64),
-                    exit,
                 ),
             );
-            if let Some(e) = exit {
-                validator_exits.insert(idx, e);
-            }
         }
-    }
-    let validator_exits = Arc::new(validator_exits);
-    if !validator_exits.is_empty() {
-        tracing::info!(
-            count = validator_exits.len(),
-            "Tracked validators with exit_epoch set — they will be skipped past exit"
-        );
     }
 
     let needs_backfill = validator_scan_state
         .values()
-        .filter(|(_, last, _)| last.is_none())
+        .filter(|(_, last)| last.is_none())
         .count();
     if needs_backfill > 0 {
         tracing::info!(count = needs_backfill, "Validators need backfill");
@@ -201,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
     if config.mode.runs_backfill() {
         let min_last_scanned = validator_scan_state
             .values()
-            .filter_map(|(_, ls, _)| *ls)
+            .filter_map(|(_, ls)| *ls)
             .min();
         if let Some(ls) = min_last_scanned
             && f0 > ls + 1
@@ -248,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(false) => {
                     backfill_should_run = false;
                     let has_existing_data =
-                        validator_scan_state.values().any(|(_, ls, _)| ls.is_some());
+                        validator_scan_state.values().any(|(_, ls)| ls.is_some());
                     if has_existing_data {
                         tracing::warn!(
                             earliest,
@@ -290,7 +264,6 @@ async fn main() -> anyhow::Result<()> {
                 &pool,
                 instance_id,
                 &tracked_set,
-                &validator_exits,
                 effective_scan_mode,
                 live_updates_tx,
                 f0,
@@ -327,10 +300,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(live_fut);
     tokio::pin!(backfill_fut);
 
-    // Symmetric outcome handling: whichever workload exits first decides the
-    // process result. The other is dropped (cancelled). The one exception is
-    // `Both` mode where backfill returning Ok is *expected* — it just caught
-    // up to f0 — so we keep running live in that case.
     tokio::select! {
         live_res = &mut live_fut => {
             match live_res {
