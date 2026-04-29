@@ -16,6 +16,7 @@ pub(super) struct MetaResponse {
     validators: std::collections::HashMap<u64, crate::config::ValidatorMeta>,
     all_tags: Vec<String>,
     chain: ChainInfo,
+    explorer_url: String,
 }
 
 pub(super) async fn get_meta(State(state): State<AppState>) -> Json<MetaResponse> {
@@ -39,5 +40,6 @@ pub(super) async fn get_meta(State(state): State<AppState>) -> Json<MetaResponse
             seconds_per_slot: spec.seconds_per_slot,
             genesis_time: spec.genesis_time,
         },
+        explorer_url: state.config.explorer_url.clone(),
     })
 }

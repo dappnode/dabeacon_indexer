@@ -6,6 +6,11 @@ let chainConfig = {
 	slots_per_epoch: 32,
 };
 
+// Block-explorer base URL. Populated from `/api/meta` on first `getMeta()`
+// call; defaults to mainnet beaconcha.in for the brief window before the
+// initial fetch resolves.
+let explorerBase = 'https://beaconcha.in';
+
 export function getApiKey(): string {
 	return localStorage.getItem('api_key') || '';
 }
@@ -66,12 +71,16 @@ export interface MetaResponse {
 	validators: Record<string, ValidatorMetaEntry>;
 	all_tags: string[];
 	chain?: ChainInfo;
+	explorer_url?: string;
 }
 
 export async function getMeta(): Promise<MetaResponse> {
 	const meta = await fetchJson<MetaResponse>(`${BASE}/meta`);
 	if (meta.chain) {
 		chainConfig = meta.chain;
+	}
+	if (meta.explorer_url) {
+		explorerBase = meta.explorer_url.replace(/\/$/, '');
 	}
 	return meta;
 }
@@ -299,9 +308,9 @@ export function timeSince(date: Date): string {
 }
 
 export function beaconchainUrl(validatorIndex: number): string {
-	return `https://beaconcha.in/validator/${validatorIndex}`;
+	return `${explorerBase}/validator/${validatorIndex}`;
 }
 
 export function beaconchainSlotUrl(slot: number): string {
-	return `https://beaconcha.in/slot/${slot}`;
+	return `${explorerBase}/slot/${slot}`;
 }

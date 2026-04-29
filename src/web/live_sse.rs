@@ -161,10 +161,12 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
     let sync_status = db_live::fetch_sync_status(pool, &tracked_i64, start_slot, end_slot).await?;
     let proposal_status = db_live::fetch_proposal_status(pool, start_slot, end_slot).await?;
 
-    // Derive per-slot block/skipped from proposal and sync rows. Either a
-    // tracked proposal row or any sync row at the slot settles it (sync rows
-    // for the same slot all share the same missed_block flag).
-    let (has_block, is_missed) = slot_block_signals(&proposal_status, &sync_status);
+    let mut block_present: HashMap<u64, bool> = HashMap::new();
+    let last_decidable_slot = end_slot.min(head_slot + 1);
+    for slot in start_slot..last_decidable_slot {
+        let (root_opt, _) = beacon_client.get_block_root(slot).await?;
+        block_present.insert(slot, root_opt.is_some());
+    }
 
     // Sync committee membership hoisted to top level. Sync committees are
     // stable within a 256-epoch period, so effectively this list is constant
@@ -243,8 +245,8 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
 
         slots.push(LiveSlot {
             slot,
-            block: has_block.contains(&slot),
-            skipped: slot <= head_slot && is_missed.contains(&slot),
+            block: block_present.get(&slot).copied().unwrap_or(false),
+            skipped: matches!(block_present.get(&slot), Some(false)),
             proposer,
             proposed,
             attestations,
@@ -315,32 +317,6 @@ async fn fetch_schedule(
         sync_by_epoch,
         proposers,
     })
-}
-
-/// (has_block, missed) derived from DB signals.
-fn slot_block_signals(
-    proposals: &HashMap<u64, (u64, bool)>,
-    sync: &HashMap<(u64, u64), (bool, bool)>,
-) -> (HashSet<u64>, HashSet<u64>) {
-    let mut has_block = HashSet::new();
-    let mut missed = HashSet::new();
-
-    for (&slot, &(_, proposed)) in proposals {
-        if proposed {
-            has_block.insert(slot);
-        } else {
-            missed.insert(slot);
-        }
-    }
-    for (&(slot, _), &(_, missed_block)) in sync {
-        if missed_block {
-            missed.insert(slot);
-        } else {
-            has_block.insert(slot);
-        }
-    }
-
-    (has_block, missed)
 }
 
 /// Finalized rows are authoritative; otherwise we only call "missed" once the

@@ -119,6 +119,13 @@ pub struct CliConfig {
     /// ≤5 validators tracked, else dense).
     #[arg(long, env = "SCAN_MODE", default_value = "auto")]
     pub scan_mode: String,
+
+    /// Base URL of a block explorer used by the web UI for "open in
+    /// explorer" links (validators, slots). Path layout follows beaconchain
+    /// (`<base>/validator/{idx}` and `<base>/slot/{slot}`). Override per
+    /// network — e.g. `https://hoodi.beaconcha.in`,
+    #[arg(long, env = "EXPLORER_URL", default_value = "https://beaconcha.in")]
+    pub explorer_url: String,
 }
 
 /// Which background workloads the process runs. Symmetric — every mode is
@@ -186,6 +193,10 @@ pub struct FileConfig {
     /// Attestation scan mode (dense|sparse|auto). Default auto.
     #[serde(default)]
     pub scan_mode: Option<String>,
+
+    /// Block-explorer base URL surfaced to the web UI.
+    #[serde(default)]
+    pub explorer_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -221,6 +232,8 @@ pub struct Config {
     pub validator_indices: Vec<u64>,
     /// Metadata per validator index (from config file)
     pub validator_meta: HashMap<u64, ValidatorMeta>,
+    /// Block-explorer base URL surfaced to the web UI via `/api/meta`.
+    pub explorer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -298,6 +311,19 @@ impl Config {
 
         let mode = RunMode::parse(&cli.mode)?;
 
+        // CLI `explorer_url` defaults to the literal mainnet URL; treat it as
+        // "user-set" only when it differs from the default so the file can
+        // override the default but a user-supplied flag still wins.
+        let default_explorer = "https://beaconcha.in";
+        let explorer_url = if cli.explorer_url != default_explorer {
+            cli.explorer_url
+        } else {
+            file_config
+                .explorer_url
+                .unwrap_or_else(|| default_explorer.to_string())
+        };
+        let explorer_url = explorer_url.trim_end_matches('/').to_string();
+
         Ok(Config {
             beacon_url,
             backfill_beacon_url,
@@ -311,6 +337,7 @@ impl Config {
             scan_mode,
             validator_indices,
             validator_meta,
+            explorer_url,
         })
     }
 }
