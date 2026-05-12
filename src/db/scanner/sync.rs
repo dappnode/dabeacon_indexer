@@ -4,8 +4,8 @@ use crate::db::Pool;
 use crate::error::Result;
 
 /// Upsert one sync-committee duty row. Like [`super::attestations::upsert_attestation_duty`],
-/// the `ON CONFLICT` `WHERE finalized = FALSE` guard is load-bearing for the
-/// multi-instance story — see [`crate::scanner::scan_epoch`].
+/// the `ON CONFLICT` guard prevents live writes from clobbering finalized rows,
+/// but allows finalized writes to backfill missing rewards on finalized rows.
 pub async fn upsert_sync_duty(
     pool: &Pool,
     validator_index: i64,
@@ -26,6 +26,7 @@ pub async fn upsert_sync_duty(
             missed_block = EXCLUDED.missed_block,
             finalized = EXCLUDED.finalized
         WHERE sync_duties.finalized = FALSE
+           OR (EXCLUDED.finalized = TRUE AND sync_duties.reward IS NULL)
         "#,
     )
     .bind(validator_index)

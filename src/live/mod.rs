@@ -37,6 +37,7 @@ pub async fn run_live_tracking(
     let start_slot = epoch_start_slot(last_backfilled_epoch) + chain::slots_per_epoch() - 1;
     let mut last_scanned_slot: Option<u64> = Some(start_slot);
     let mut last_finalized_rescanned_epoch = last_backfilled_epoch;
+    let mut last_rewards_fetched_epoch: Option<u64> = Some(last_backfilled_epoch);
     tracing::info!(
         last_backfilled_epoch,
         start_slot,
@@ -72,6 +73,7 @@ pub async fn run_live_tracking(
                                     &scan_validators,
                                     &head,
                                     &mut last_scanned_slot,
+                                    &mut last_rewards_fetched_epoch,
                                 )
                                 .await
                                 .map_err(|e| {
@@ -147,6 +149,7 @@ pub async fn run_live_tracking(
                                     pool,
                                     &reorg,
                                     &mut last_scanned_slot,
+                                    &mut last_rewards_fetched_epoch,
                                 )
                                 .await
                                 .map_err(|e| {

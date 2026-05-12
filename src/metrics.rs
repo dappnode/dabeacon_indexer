@@ -414,6 +414,30 @@ pub static LIVE_REORGS: Lazy<IntCounter> = Lazy::new(|| {
     .expect("register live_reorgs_total")
 });
 
+pub static LIVE_EPOCH_REWARDS_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec_with_registry!(
+        HistogramOpts::new(
+            "live_epoch_rewards_duration_seconds",
+            "Wall time for eager epoch-transition reward fetching."
+        )
+        .buckets(epoch_scan_buckets()),
+        &["stage"],
+        REGISTRY
+    )
+    .expect("register live_epoch_rewards_duration_seconds")
+});
+
+pub static LIVE_EPOCHS_INCOMPLETE: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter_with_registry!(
+        Opts::new(
+            "live_epochs_incomplete_total",
+            "Epochs finalized without reward data (state was pruned and epoch-transition fetch was missed)."
+        ),
+        REGISTRY
+    )
+    .expect("register live_epochs_incomplete_total")
+});
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------

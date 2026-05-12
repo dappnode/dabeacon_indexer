@@ -40,6 +40,18 @@ pub(super) async fn process_finalized_rescan(
 
     let tracked_indices: Vec<i64> = scan_validators.iter().map(|&v| v as i64).collect();
 
+    // --- Check-and-promote: only re-scan epochs whose rewards are missing ---
+    // The epoch-transition eager fetch (in the head handler) writes rewards
+    // with `finalized = false` as soon as an epoch completes. For those
+    // epochs, finalization only needs to flip the `finalized` flag — no
+    // beacon API calls required. If the eager fetch was missed (downtime,
+    // SSE reconnect), we fall back to a full scan_epoch here.
+    //
+    // When rewards ARE present, we still attempt a full finalized rescan as
+    // a best-effort upgrade: dense-mode vote correctness, inclusion_slot for
+    // late-epoch attestations, and authoritative finalized rows. If the
+    // beacon state is already pruned, the attempt fails silently and the
+    // eager-fetch data (already present) is promoted as-is.
     let rescan_started_at = std::time::Instant::now();
     for epoch in from_epoch..=finalized.epoch {
         let active =
@@ -48,12 +60,41 @@ pub(super) async fn process_finalized_rescan(
         if active.is_empty() {
             continue;
         }
-        scanner::scan_epoch(client, pool, epoch, &active, true, scan_mode)
+
+        let has_rewards = scanner::epoch_has_rewards(pool, epoch)
             .await
-            .map_err(|e| {
-                tracing::error!(epoch, error = %e, "Failed to re-scan finalized epoch; aborting");
-                e
-            })?;
+            .unwrap_or(false);
+
+        match scanner::scan_epoch(client, pool, epoch, &active, true, scan_mode).await {
+            Ok(()) => {
+                tracing::info!(epoch, "Finalized rescan succeeded");
+            }
+            Err(e) => {
+                if has_rewards {
+                    // Eager-fetch data is present — the failure only means we
+                    // couldn't upgrade to authoritative finalized data (e.g.
+                    // dense vote correctness, missing inclusion_slots). This
+                    // is acceptable; the eager data will be promoted as-is.
+                    tracing::debug!(
+                        epoch,
+                        error = %e,
+                        "Finalized rescan failed but eager-fetch rewards are present; \
+                         promoting existing data"
+                    );
+                } else {
+                    // No rewards at all — state was pruned and eager fetch was
+                    // missed. The head tracker's duty rows (inclusions, proposals,
+                    // sync participation) will be promoted without reward data.
+                    tracing::warn!(
+                        epoch,
+                        error = %e,
+                        "Finalized rescan failed and no eager-fetch rewards; \
+                         epoch will be finalized without reward data"
+                    );
+                    crate::metrics::LIVE_EPOCHS_INCOMPLETE.inc();
+                }
+            }
+        }
     }
     crate::metrics::LIVE_FINALIZED_RESCAN_DURATION
         .with_label_values(&["rescan_loop"])

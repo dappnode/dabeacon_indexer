@@ -172,6 +172,59 @@ async fn main() -> anyhow::Result<()> {
 
     let mut backfill_should_run = config.mode.runs_backfill();
 
+    // ─── Gap detection ─────────────────────────────────────────────────────
+    // Check whether the DB has attestation_duties rows for each validator's
+    // full range [effective_start, last_scanned]. A mismatch means a previous
+    // live-only run advanced one or more watermarks past epochs it never scanned.
+    if config.mode.runs_backfill() && !config.non_contiguous_backfill {
+        let mut coverage_ranges: Vec<(i64, i64, i64)> = Vec::new();
+        let mut expected = 0_u64;
+
+        for (&validator_index, &(activation_epoch, last_scanned_epoch)) in &validator_scan_state {
+            let Some(last_scanned_epoch) = last_scanned_epoch else {
+                continue;
+            };
+            let start_epoch = config
+                .max_backfill_depth
+                .map_or(activation_epoch, |depth| activation_epoch.max(depth));
+            if last_scanned_epoch < start_epoch {
+                continue;
+            }
+
+            coverage_ranges.push((
+                validator_index as i64,
+                start_epoch as i64,
+                last_scanned_epoch as i64,
+            ));
+            expected += last_scanned_epoch - start_epoch + 1;
+        }
+
+        if !coverage_ranges.is_empty() {
+            let from_epoch = coverage_ranges.iter().map(|(_, from, _)| *from).min().unwrap() as u64;
+            let to_epoch = coverage_ranges.iter().map(|(_, _, to)| *to).max().unwrap() as u64;
+            let found = db::scanner::attestations::count_covered_validator_epochs(
+                &pool,
+                &coverage_ranges,
+            )
+            .await
+            .unwrap_or(0) as u64;
+            let missing = expected.saturating_sub(found);
+            if missing > 0 {
+                tracing::warn!(
+                    from_epoch,
+                    to_epoch,
+                    validators = coverage_ranges.len(),
+                    expected_validator_epochs = expected,
+                    found_validator_epochs = found,
+                    missing_validator_epochs = missing,
+                    "Data gaps detected in attestation_duties. A previous \
+                     live-only run likely advanced watermarks past unscanned \
+                     validator epochs. Run with `--non-contiguous-backfill` to fill gaps."
+                );
+            }
+        }
+    }
+
     if config.mode.runs_backfill() {
         let min_last_scanned = validator_scan_state
             .values()
@@ -228,16 +281,16 @@ async fn main() -> anyhow::Result<()> {
                             earliest,
                             f0,
                             "Data gap cannot be refilled by the live (shared) beacon client \
-                             (state at epoch {earliest} has been pruned). Skipping backfill — \
-                             live tracking continues. To refill, point `backfill_beacon_url` \
-                             at an archive node and run with `--non-contiguous-backfill`."
+                             (historical states pruned). Skipping backfill — live tracking \
+                             continues. To refill, point `backfill_beacon_url` at an archive \
+                             node and run with `--non-contiguous-backfill`."
                         );
                     } else {
                         tracing::warn!(
                             earliest,
-                            "Skipping backfill: the live (shared) beacon client cannot serve \
-                             epoch {earliest} (state pruned). Set `backfill_beacon_url` to an \
-                             archive node for full history. Live tracking will continue."
+                            "Skipping backfill: beacon node has pruned historical states. \
+                             Set `backfill_beacon_url` to an archive node for full history. \
+                             Live tracking will continue."
                         );
                     }
                 }

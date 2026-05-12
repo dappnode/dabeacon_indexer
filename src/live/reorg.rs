@@ -1,5 +1,6 @@
 use crate::beacon_client::BeaconClient;
 use crate::beacon_client::types::ChainReorgEvent;
+use crate::chain::slot_to_epoch;
 use crate::db::Pool as PgPool;
 use crate::db::scanner;
 use crate::error::Result;
@@ -9,6 +10,7 @@ pub(super) async fn process_chain_reorg(
     pool: &PgPool,
     reorg: &ChainReorgEvent,
     last_scanned_slot: &mut Option<u64>,
+    last_rewards_fetched_epoch: &mut Option<u64>,
 ) -> Result<()> {
     let revert_from = reorg.slot.saturating_sub(reorg.depth.saturating_sub(1));
     tracing::warn!(
@@ -52,6 +54,27 @@ pub(super) async fn process_chain_reorg(
             );
             *last_scanned_slot = Some(target);
         }
+    }
+
+    // Roll back the reward-fetch watermark if the reorg invalidates an epoch
+    // whose rewards were already eagerly fetched. delete_non_finalized_slots
+    // above wiped the reward rows; this ensures the epoch-transition logic in
+    // the head handler will re-fetch them.
+    let revert_epoch = slot_to_epoch(revert_from);
+    if let Some(last_reward_ep) = *last_rewards_fetched_epoch
+        && revert_epoch <= last_reward_ep
+    {
+        let new_watermark = revert_epoch.saturating_sub(1);
+        tracing::info!(
+            previous_last_rewards_epoch = last_reward_ep,
+            new_last_rewards_epoch = new_watermark,
+            "Rolling back reward-fetch watermark after reorg"
+        );
+        *last_rewards_fetched_epoch = if new_watermark == 0 {
+            None
+        } else {
+            Some(new_watermark)
+        };
     }
 
     Ok(())

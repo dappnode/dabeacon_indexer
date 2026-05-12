@@ -4,8 +4,8 @@ use crate::db::Pool;
 use crate::error::Result;
 
 /// Upsert one block-proposal row. Like [`super::attestations::upsert_attestation_duty`],
-/// the `ON CONFLICT` `WHERE finalized = FALSE` guard is load-bearing for the
-/// multi-instance story — see [`crate::scanner::scan_epoch`].
+/// the `ON CONFLICT` guard prevents live writes from clobbering finalized rows,
+/// but allows finalized writes to backfill missing rewards on finalized rows.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_block_proposal(
     pool: &Pool,
@@ -34,6 +34,7 @@ pub async fn upsert_block_proposal(
             reward_slashings = EXCLUDED.reward_slashings,
             finalized = EXCLUDED.finalized
         WHERE block_proposals.finalized = FALSE
+           OR (EXCLUDED.finalized = TRUE AND block_proposals.reward_total IS NULL)
         "#,
     )
     .bind(slot)

@@ -9,19 +9,19 @@ use crate::error::{Error, Result};
 use futures::future::join_all;
 
 /// Probe the beacon node once for the epoch's sync `participant_reward`
-/// magnitude. Walks `slot_blocks` until it finds a block-present slot,
-/// asks the rewards endpoint for that slot with our tracked committee
-/// members, and returns the first non-zero `|reward|`.
+/// magnitude. Walks `slot_blocks` until it finds a block-present slot
+/// whose parent state is available, asks the rewards endpoint for that
+/// slot with our tracked committee members, and returns the first
+/// non-zero `|reward|`.
 ///
 /// The participant reward is a function of `total_active_balance`,
 /// `SLOTS_PER_EPOCH`, and `SYNC_COMMITTEE_SIZE` only — it's uniform
 /// across every member at every slot in the epoch. So one fetch beats
 /// fanning out across all 32 slots.
 ///
-/// Returns `Ok(None)` when every slot in the epoch was missed (no block
-/// to probe). Returns `Err` if a block-present slot returned no usable
-/// (non-zero) reward — that's a degenerate state that shouldn't happen
-/// on a valid Altair chain.
+/// Returns `Ok(None)` when every block-present slot failed (no block to
+/// probe, or every parent state was pruned). The caller writes
+/// participation rows with `reward = NULL` when that happens.
 async fn probe_sync_participant_reward(
     client: &BeaconClient,
     slot_blocks: &[(u64, Option<SignedBeaconBlock>)],
@@ -31,16 +31,27 @@ async fn probe_sync_participant_reward(
         if block.is_none() {
             continue;
         }
-        let rewards = client.get_sync_committee_rewards(*slot, relevant).await?;
+        let rewards = match client.get_sync_committee_rewards(*slot, relevant).await {
+            Ok(r) => r,
+            Err(Error::BeaconApi { status: 404, .. }) => {
+                tracing::debug!(
+                    slot,
+                    "Sync rewards probe: parent state pruned, trying next slot"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(magnitude) = rewards.iter().map(|r| r.reward.abs()).find(|&m| m > 0) {
             tracing::debug!(slot = *slot, magnitude, "Probed sync participant_reward");
             return Ok(Some(magnitude));
         }
-        return Err(Error::InconsistentBeaconData(format!(
-            "block-present slot {slot} returned no non-zero sync rewards \
-             across {} tracked committee members",
-            relevant.len(),
-        )));
+        // Block present but all rewards are 0 — unusual but not fatal on a
+        // non-archival node where the response may be incomplete. Try next.
+        tracing::debug!(
+            slot,
+            "Sync rewards probe: all rewards zero, trying next slot"
+        );
     }
     Ok(None)
 }

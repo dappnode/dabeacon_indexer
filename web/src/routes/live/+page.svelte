@@ -299,9 +299,9 @@
 			return 'border-rose-300 bg-[radial-gradient(circle_at_top_left,_rgba(251,113,133,0.14),_transparent_58%),linear-gradient(180deg,_rgba(69,10,10,0.28),_rgba(3,7,18,0.96))] shadow-[0_0_0_1px_rgba(251,113,133,0.2),0_10px_20px_rgba(127,29,29,0.14)]';
 		}
 
-		// Rule 2: any other skipped slot — dimmer than future, washed-out grey.
+		// Rule 2: any other skipped slot — yellow tint (network missed block).
 		if (slot.skipped) {
-			return 'border-gray-700/70 bg-[linear-gradient(180deg,_rgba(51,65,85,0.08),_rgba(2,6,23,0.78))] shadow-[0_0_0_1px_rgba(71,85,105,0.12)]';
+			return 'border-yellow-300/50 bg-[radial-gradient(circle_at_top_left,_rgba(253,224,71,0.20),_transparent_55%),linear-gradient(180deg,_rgba(202,138,4,0.16),_rgba(3,7,18,0.96))] shadow-[0_0_0_1px_rgba(253,224,71,0.22)]';
 		}
 
 		// Rule 4: tracked validator proposed.

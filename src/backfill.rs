@@ -52,11 +52,13 @@ pub fn earliest_epoch_to_scan(
 /// - `Err`: transport / non-404 API error. The caller decides whether to
 ///   treat this as fatal or just "proceed and let the real run fail loudly."
 pub async fn probe_archival_capability(client: &BeaconClient, epoch: u64) -> Result<bool> {
-    if epoch == 0 {
-        // Genesis state is always available on every client.
-        return Ok(true);
-    }
-    let state_id = (epoch * chain::slots_per_epoch()).to_string();
+    // The rewards/duties APIs for epoch N internally need the state at the
+    // epoch N→N+1 boundary — NOT just the start-of-epoch state. For epoch 0
+    // the genesis state (slot 0) is always retained, but slot 32+ (epoch 1
+    // start) may be pruned. Probe at epoch 1 when asked about epoch 0 to
+    // avoid a false positive.
+    let probe_epoch = epoch.max(1);
+    let state_id = (probe_epoch * chain::slots_per_epoch()).to_string();
     match client.get_finality_checkpoints(&state_id).await {
         Ok(_) => Ok(true),
         Err(Error::BeaconApi { status: 404, .. }) => Ok(false),

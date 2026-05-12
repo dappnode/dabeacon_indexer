@@ -9,6 +9,8 @@ pub use sync_committee::upsert_live_sync_in_slot;
 
 use std::collections::HashSet;
 
+use sqlx::Row;
+
 use crate::beacon_client::BeaconClient;
 use crate::chain;
 use crate::config::EffectiveScanMode;
@@ -128,4 +130,139 @@ pub async fn scan_epoch(
         "Epoch scan complete"
     );
     Ok(())
+}
+
+/// Eagerly fetch rewards for a completed epoch while the beacon node still
+/// has its state. Called with a 1-epoch lag: rewards for epoch N are fetched
+/// at the epoch N+1→N+2 boundary. This ensures late-included attestations
+/// from epoch N (which may be included in blocks during epoch N+1) are
+/// reflected in the participation flags the rewards API reads.
+///
+/// This function intentionally uses sparse-mode attestation logic regardless
+/// of the configured scan mode: sparse doesn't need the inclusion-window
+/// blocks (which may not fully exist yet at the epoch boundary), and the
+/// head tracker has already recorded inclusion data from block bodies.
+///
+/// Rows already written by the head tracker (with `inclusion_slot` set) may
+/// reject the full upsert via the `ON CONFLICT … inclusion_slot` guard, so
+/// we follow up with a targeted `update_attestation_rewards_batch` to fill
+/// in just the reward columns on those rows.
+///
+/// Proposals and sync duties use `finalized = false` upserts — their ON
+/// CONFLICT clauses allow overwriting non-finalized rows freely.
+pub async fn process_epoch_rewards(
+    client: &BeaconClient,
+    pool: &PgPool,
+    epoch: u64,
+    scan_validators: &HashSet<u64>,
+    head_slot: u64,
+) -> Result<()> {
+    if scan_validators.is_empty() {
+        return Ok(());
+    }
+
+    let timer = std::time::Instant::now();
+    let is_altair = epoch >= chain::altair_epoch();
+
+    tracing::info!(
+        epoch,
+        validator_count = scan_validators.len(),
+        is_altair,
+        head_slot,
+        "Eager epoch-transition reward fetch"
+    );
+
+    let scan_validator_indices: Vec<u64> = scan_validators.iter().copied().collect();
+
+    // --- Attestation rewards ---
+    // Always use sparse: it doesn't need the full inclusion window of blocks.
+    // The full upsert handles new rows; the batch UPDATE handles rows the head
+    // tracker already wrote (where the upsert's inclusion_slot guard rejects).
+    let att_t = std::time::Instant::now();
+    attestations::process_epoch_attestation_duties_sparse(
+        client,
+        pool,
+        epoch,
+        scan_validators,
+        false,
+    )
+    .await?;
+
+    // Fetch rewards again for the batch UPDATE on rows the upsert skipped.
+    let att_rewards = client
+        .get_attestation_rewards(epoch, &scan_validator_indices)
+        .await?;
+    let reward_tuples: Vec<crate::db::scanner::attestations::RewardTuple> = att_rewards
+        .total_rewards
+        .iter()
+        .map(|r| {
+            (
+                r.validator_index as i64,
+                epoch as i64,
+                Some(r.source),
+                Some(r.target),
+                Some(r.head),
+                r.inactivity,
+            )
+        })
+        .collect();
+    crate::db::scanner::attestations::update_attestation_rewards_batch(pool, &reward_tuples)
+        .await?;
+    crate::metrics::LIVE_EPOCH_REWARDS_DURATION
+        .with_label_values(&["attestations"])
+        .observe(att_t.elapsed().as_secs_f64());
+
+    // --- Proposal rewards ---
+    // Non-fatal: if proposals fail (e.g. block pruned), attestation rewards
+    // are already committed. Log and continue.
+    let prop_t = std::time::Instant::now();
+    if let Err(e) =
+        proposals::process_epoch_proposals(client, pool, epoch, scan_validators, false).await
+    {
+        tracing::warn!(epoch, error = %e, "Proposal reward fetch failed; attestation rewards preserved");
+    }
+    crate::metrics::LIVE_EPOCH_REWARDS_DURATION
+        .with_label_values(&["proposals"])
+        .observe(prop_t.elapsed().as_secs_f64());
+
+    // --- Sync committee rewards ---
+    // Non-fatal: sync requires fetching all 32 blocks which is expensive and
+    // may fail if blocks are pruned. Attestation rewards are already committed.
+    if is_altair {
+        let sync_t = std::time::Instant::now();
+        if let Err(e) =
+            sync_committee::process_epoch_sync(client, pool, epoch, scan_validators, false).await
+        {
+            tracing::warn!(epoch, error = %e, "Sync committee reward fetch failed; attestation rewards preserved");
+        }
+        crate::metrics::LIVE_EPOCH_REWARDS_DURATION
+            .with_label_values(&["sync_committee"])
+            .observe(sync_t.elapsed().as_secs_f64());
+    }
+
+    crate::metrics::LIVE_EPOCH_REWARDS_DURATION
+        .with_label_values(&["total"])
+        .observe(timer.elapsed().as_secs_f64());
+    tracing::info!(
+        epoch,
+        elapsed_ms = timer.elapsed().as_millis() as u64,
+        "Eager epoch-transition reward fetch complete"
+    );
+    Ok(())
+}
+
+/// Check whether reward data is already present for an epoch (i.e. the
+/// epoch-transition eager fetch already ran). Returns `true` if at least one
+/// tracked validator has a non-NULL `source_reward` for this epoch.
+pub async fn epoch_has_rewards(pool: &PgPool, epoch: u64) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT EXISTS(
+            SELECT 1 FROM attestation_duties
+            WHERE epoch = $1 AND source_reward IS NOT NULL
+        ) AS has_rewards",
+    )
+    .bind(epoch as i64)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<bool, _>("has_rewards"))
 }
