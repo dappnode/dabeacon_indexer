@@ -167,7 +167,7 @@ export interface AttestationRow {
 	assigned_slot: number;
 	committee_index: number;
 	committee_position: number;
-	included: boolean;
+	included: boolean | null;
 	inclusion_slot: number | null;
 	inclusion_delay: number | null;
 	effective_inclusion_delay: number | null;

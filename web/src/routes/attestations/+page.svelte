@@ -279,7 +279,7 @@
 			<tbody>
 				{#each result.data as r}
 					{@const rowTags = getTags(r.validator_index)}
-					<tr class="{tableBodyRow} {!r.included ? 'bg-red-950/20' : ''}">
+					<tr class="{tableBodyRow} {r.included === false ? 'bg-red-950/20' : ''}">
 						<td class="w-[240px] max-w-[240px] px-3 py-1.5 align-top">
 							<div class="flex flex-wrap items-center gap-1">
 								<a href={beaconchainUrl(r.validator_index)} target="_blank" rel="noopener" class="font-mono text-blue-400 hover:underline whitespace-nowrap pr-1.5">{r.validator_index}</a>
@@ -303,8 +303,10 @@
 								{#if r.inclusion_delay !== null}
 									<span class="text-gray-500 text-xs ml-1">(slot {r.inclusion_slot})</span>
 								{/if}
-							{:else}
+							{:else if r.included === false}
 								<span class="text-red-400 font-bold">MISSED</span>
+							{:else}
+								<span class="text-gray-400">Unknown</span>
 							{/if}
 						</td>
 						<td class="px-3 py-1.5">

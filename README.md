@@ -14,13 +14,13 @@ Designed to share a beacon node that's also doing validation duties: historical 
 
 - **Per-epoch attestation, proposal, sync-committee tracking** — inclusion slot, vote correctness (head / target / source), rewards.
 - **Live head tracking** via beacon SSE (`head`, `finalized_checkpoint`, `chain_reorg`). Reorgs delete non-finalized rows and re-scan.
-- **Concurrent live + backfill** in the same process. Each owns a disjoint epoch range (`live` owns `(f₀, ∞)`, `backfill` owns `[…=f₀]`) so no row is scanned twice. Live has foreground priority.
-- **Optional split beacon clients** — point `backfill_beacon_url` at an archive node while the live client stays on your validator's attached (non-archive) node. On startup the indexer probes the backfill node and warns/errors if it can't serve the earliest epoch you need.
+- **Concurrent live + backfill**: recent collection starts independently of historical catch-up. The archive worker also repairs persisted live gaps after finality, including gaps created after startup.
+- **Optional split beacon clients** — point `backfill_beacon_url` at an archive node while the live client stays on your validator's attached (non-archive) node. Combined mode starts live tracking independently and retries unavailable backfill every 60 seconds. Backfill-only mode probes historical state and exits on failure.
 - **Chain-spec driven constants** — `SLOTS_PER_EPOCH`, `SECONDS_PER_SLOT`, `SYNC_COMMITTEE_SIZE`, `MAX_COMMITTEES_PER_SLOT`, `ALTAIR_FORK_EPOCH` are fetched from `/eth/v1/config/spec` at startup. Works unchanged on mainnet, holesky, hoodi, or any custom network.
 - **Cross-fork block deserialization** — one typed struct per fork (phase0 → fulu). Electra attestation encoding (EIP-7549 `committee_bits`) is decoded correctly.
-- **Multiple indexer instances, one DB** — per-validator watermarks use `GREATEST`; finalized rows are immutable; reorg deletes target only non-finalized rows. A non-archive head-tracker and an archive backfiller can target the same validator set on the same DB.
-- **Strict data invariants** — malformed SSZ, size mismatches, missing committee entries, inclusion-slot < attestation-slot, etc. all surface as `Error::InconsistentBeaconData` and abort the epoch rather than writing partial data.
-- **In-memory caches** on the beacon client: head slot (2 s TTL), head finality checkpoints (10 s TTL), per-epoch committees + proposer/attester/sync duties. Invalidated on reorg.
+- **Single live writer per validator set** — completed finalized scans are immutable and reorg cleanup only removes unfinalized evidence. Coordination between overlapping live writers remains out of scope.
+- **Strict data invariants** — malformed SSZ, size mismatches, missing committee entries, inclusion-slot < attestation-slot, etc. all surface as `Error::InconsistentBeaconData` and leave the epoch incomplete. Successful earlier writes are retained for retry.
+- **Durable recent input cache** for committees and proposer/attester/sync duties, validated against canonical anchors before reuse after restart.
 
 ---
 
@@ -122,7 +122,7 @@ All settings may be passed via CLI flag, env var, or TOML file. Precedence: CLI 
 
 | CLI / env | TOML | Default | Purpose |
 |---|---|---|---|
-| `--beacon-url` / `BEACON_URL` | `beacon_url` | `http://localhost:5052` | Live client (head tracking, finality rescan, SSE). Non-archive nodes are supported but **experimental**, and the beacon node has to be configured accordingly. |
+| `--beacon-url` / `BEACON_URL` | `beacon_url` | `http://localhost:5052` | Live client (recent collection, finality verification, SSE). Requires recent blocks, duties, and applicable reward APIs; unavailable components remain explicit gaps. |
 | `--backfill-beacon-url` / `BACKFILL_BEACON_URL` | `backfill_beacon_url` | *(shares live)* | Optional separate client for historical backfill. Must be archive-capable if set. |
 
 ### Database
@@ -159,8 +159,8 @@ tags = ["pool-a", "node-2"]
 |---|---|---|
 | `--mode` / `RUN_MODE` | `both` | Which workloads to run: `live` (head tracking + finality rescans + web server only — no historical backfill), `backfill` (one-shot historical catch-up, no live, no web), or `both`. See [Running modes](#running-modes). |
 | `--max-backfill-depth` / `MAX_BACKFILL_DEPTH` | *(unlimited)* | Clamp the earliest epoch backfill will start from. Protects against accidentally re-scanning from genesis for a newly-added validator. |
-| `--non-contiguous-backfill` / `NON_CONTIGUOUS_BACKFILL` | `false` | Walk every epoch in the backfill range and scan only those (validator, epoch) pairs that don't already have a finalized row. Use after widening validator set or reducing `max_backfill_depth`. |
-| `--scan-mode` / `SCAN_MODE` | `auto` | Attestation scan strategy. `dense` fetches every block in the epoch and derives correctness from attestations vs the canonical chain — amortises well for 30+ validators. `sparse` derives correctness from rewards and scans forward block-by-block only for duties the rewards show were included — ~4–5 API calls per epoch vs ~100 for dense. `auto` resolves to `sparse` when 5 or fewer validators are tracked. See [scan mode semantics](#attestation-scan-modes). |
+| `--non-contiguous-backfill` / `NON_CONTIGUOUS_BACKFILL` | `false` | Walk every epoch in the backfill range and scan only those (validator, epoch) pairs that don't already have a completed scan. Use after widening validator set or reducing `max_backfill_depth`. |
+| `--scan-mode` / `SCAN_MODE` | `auto` | Attestation scan strategy. `dense` fetches every block in the epoch and derives correctness from attestations vs the canonical chain — amortises well for 30+ validators. `sparse` scans forward per duty and uses positive rewards as evidence of vote correctness; zero rewards never establish a miss. `auto` resolves to `sparse` when 5 or fewer validators are tracked. See [scan mode semantics](#attestation-scan-modes). |
 
 ### Web server
 
@@ -184,13 +184,13 @@ cargo run --release
 On startup the indexer:
 
 1. Connects to the beacon node, fetches the chain spec, seeds validator metadata.
-2. Reads the current finality checkpoint `f₀`.
+2. Reads the current finality checkpoint and sets the safe scan target `f₀` to its epoch minus two (no safe epoch yet if the checkpoint is below two).
 3. Spawns a background task that backfills epochs `[…=f₀]` (using the backfill client — archive node if configured).
-4. Runs live head tracking in the foreground, owning epochs `(f₀, ∞)`.
+4. Starts recent live collection with durable per-slot coverage, independent reward jobs, and periodic reconciliation.
 5. The web server runs from startup with both DB reads and the SSE stream.
 6. A periodic reconcile task re-fetches active validators' state every epoch so exits land in the DB without a process restart.
 
-Live and backfill never touch the same epoch. `finalized=true` rows are immutable; live's `finalized=false` rows get promoted on the next `finalized_checkpoint` event.
+Live evidence promotion and historical backfill use the same conservative finality boundary: epoch E is safe when checkpoint E+2 is finalized. A finalized checkpoint anchors an epoch's start, and attestations from E can still be included through E+1. `completed_scans` records successful scans separately from on-chain finality. Incomplete finalized rows can be repaired by a later finalized scan; live writes cannot overwrite them.
 
 ### `backfill` only
 
@@ -208,9 +208,9 @@ No web server, no live tracking. Re-extends finality if the chain advances mid-p
 cargo run --release -- --mode live
 ```
 
-Head tracking + finality rescans + web server, **no** historical backfill. Two situations where this is the right pick:
+Recent collection + finality verification + web server, **no** historical backfill. Two situations where this is the right pick:
 
-- **Multi-instance**: historical data is owned by a separate dedicated backfill instance writing to the same Postgres (typical: one head-tracker per validator's local non-archive node, one shared archive backfiller). The indexer assumes the DB is already (or being) populated by another writer for everything up to `f₀` and just owns `(f₀, ∞)`.
+- **Multi-instance**: historical data is owned by a separate dedicated backfill instance writing to the same Postgres (typical: one head-tracker per validator's local non-archive node, one shared archive backfiller). Recent collection does not certify older history; use completed-scan coverage to identify gaps.
 - **No archive client available**: you only have a non-archive beacon node and don't want to run an archive node. Live mode keeps working — but **the DB will only contain data from the moment this instance first started forward**, so any view spanning epochs older than that startup will show gaps. Acceptable for "I just want to track from now on", not for historical analysis.
 
 ### Split archive / non-archive nodes
@@ -223,17 +223,34 @@ beacon_url = "http://10.0.0.10:5052"           # non-archive, attached to valida
 backfill_beacon_url = "http://10.0.0.20:5052"  # archive
 ```
 
-The startup flow probes the backfill client at the earliest epoch it will try to scan. If the probe fails **and** `backfill_beacon_url` is set, the indexer exits with a descriptive error (`backfill_beacon_url must be an archive node`). If no dedicated URL is set and the shared client can't serve the range, you get a warning that tells you exactly which flag to set.
+In `both` mode, an unavailable archive node does not delay live startup or stop the process. Failed backfill attempts retry after 60 seconds, skipping completed epochs. After catch-up, the worker continues repairing persisted live gaps with a bounded budget. In `backfill` mode, failures still exit with an error so a one-shot job cannot report success with missing history.
 
-### Resuming after downtime
+### Resuming and repairing gaps
 
-Restarting any time just works; the indexer resumes from each validator's `last_scanned_epoch` watermark. If the gap exceeds the live node's retention (~1 day on a default Lighthouse) the startup probe warns you to set `backfill_beacon_url` + `--non-contiguous-backfill` to refill the gap.
+Normal backfill resumes from validator watermarks. A watermark records how far the indexer has progressed, not proof that every earlier epoch is complete. Run with `--non-contiguous-backfill` and an archive node to repair missing rewards, failed scan stages, or gaps from downtime. Completion is recorded only after attestations, proposals, and sync duties all succeed.
+
+Without an archive node, live tracking collects recent block outcomes and proposal/sync rewards while their pre-states are available. Attestation rewards for E are fetched in E+2, with independent retries. Duties and committee mappings survive restart in a cache checked against canonical block anchors. Successful reward responses are staged even when their duty rows cannot yet be joined. Finalization verifies stored ancestry and coverage; it does not require another historical-state scan.
+
+SSE wakes a single writer; polling and reconnect reconciliation recover missed events. Block ancestry is resolved by parent roots. Unavailable named blocks remain unresolved, and missing data never becomes a confirmed missed duty just because time has passed. Long outages leave gaps for archive repair while recent collection resumes. Retry limits control request effort; they do not prove an endpoint is permanently unsupported.
+
+```toml
+[live]
+lag_slots = 2
+poll_interval_seconds = 12
+retry_window_epochs = 4
+```
+
+`--live-lag-slots` / `LIVE_LAG_SLOTS` overrides the block lag. The other live settings are TOML options. Two slots is an initial operational default, not a measured universal guarantee. State retention and reward endpoint availability vary across clients; there is no portable one-day retention assumption. The node must serve the recent block range used for reconciliation. Explicit optimistic responses are rejected. Missing optional metadata is not treated as proof of finality: authoritative completion additionally requires the node's finalized checkpoint and connected ancestry. The model assumes a coherent, trustworthy beacon endpoint.
+
+`live_pending_jobs{status="pending"|"needs_backfill"}`, `live_gap_validator_epochs`, `live_oldest_gap_epoch`, and `live_last_reward_success_epoch` expose unresolved work and recent collection progress. Old gaps remain repairable; `--non-contiguous-backfill` also finds historical gaps predating live job records. In `live` mode, reward failures cannot be repaired automatically after their state is pruned.
+
+**Existing databases:** the single pending migration adds completion, recent evidence, input cache, and job tables, plus `inclusion_known`. Legacy rows remain unverified until a successful scan. Confirmed inclusions remain visible; absence is exposed as unknown until coverage is proven. `001_initial.sql` is unchanged; all undeployed additions are consolidated into `002_epoch_scan_completion.sql`.
 
 ---
 
 ## Attestation scan modes
 
-`--scan-mode` controls the attestation stage of finalized scans (backfill + finalization rescan). Live scans are unaffected.
+`--scan-mode` controls the attestation stage of finalized archive scans. Live scans are unaffected.
 
 ### Dense (default for >5 validators)
 
@@ -241,30 +258,26 @@ Fetches every block in the epoch and a one-epoch "late window" for inclusion dis
 
 ### Sparse (default for ≤5 validators)
 
-Fetches `/eth/v1/validator/duties/attester/{epoch}` + `/eth/v1/beacon/rewards/attestations/{epoch}` plus (cached) committees. For each tracked duty whose rewards show inclusion, scans forward block-by-block from the duty's slot until the including block is found. For duties the rewards show as missed, skips the block scan entirely.
+Fetches duties, rewards, and committees, then scans forward for every tracked duty until inclusion is found or the full inclusion window is covered. Zero or negative rewards do not skip inclusion discovery. Requests can still be cheaper for small validator sets, but the old 4–5-call estimate did not cover missed duties correctly.
 
-Typical network cost drops from ~100 calls/epoch to ~4–5, making long backfills on tiny validator sets practical.
+### Correctness fields
 
-### Semantic difference to be aware of
+Both modes use `*_correct` for vote correctness. Dense mode compares votes with canonical context. Sparse mode records `true` when a positive reward proves a correct vote; otherwise the flag remains `null` rather than falsely claiming an incorrect vote. A dense repair can refine unknown flags. Conflicting multiple attestations are not modeled as separate votes; the fields summarize available evidence.
 
-Dense mode's `*_correct` columns mean "the vote was right". Sparse mode's mean "the validator earned the reward for that component", which requires correct vote AND timely inclusion (next slot for head, within ~5 for source, within 32 for target). A correct head vote included one slot late reads `head_correct = false` in sparse but `true` in dense. Operators typically care about the reward-qualifying definition; sparse mode surfaces that directly.
-
-All reward columns, the `included` flag, `inclusion_slot`, and `inclusion_delay` match between modes (modulo rare beacon-node quirks where rewards show inclusion but the block scan can't locate it — then `inclusion_slot` is NULL and a warning is logged).
+`included` is `true` for observed inclusion, `false` for a proven miss, and `null` for incomplete coverage in the REST and live APIs. Unknown duties are excluded from missed-duty counts and participation-rate denominators. Reward values remain nullable when unavailable. Effective inclusion delay also remains unknown when skipped-slot coverage is insufficient.
 
 ---
 
 ## Multi-instance (sharing a Postgres)
 
-Safe scenarios:
+Supported without writer coordination:
 
 - **Two indexers tracking disjoint validator sets** (e.g. one handles indices 1–500, another handles 501–1000). Per-validator watermarks + row upserts guarantee independence.
-- **One head-tracker + one dedicated archive backfiller on the same set.** The backfiller writes `finalized=true` rows; the head-tracker writes `finalized=false` rows that get promoted on finality. Reorg deletes only non-finalized rows, so the backfiller's output is immutable against the head-tracker's reorg path.
+Unsupported:
 
-Unsafe:
+- Multiple writers on overlapping validator sets, including a separate live and archive process. Use `both` mode in one process when live and archive collection share validators.
 
-- Two head-trackers on overlapping validator sets — they'll churn on every reorg (each deletes the other's non-finalized rows).
-
-The `finalized=true`-means-immutable invariant is load-bearing. It's documented on every write function in `src/db/scanner/*` and on `scanner::scan_epoch`. Don't violate it.
+Live writes cannot overwrite finalized rows. Finalized rescans can repair an incomplete epoch until its `completed_scans` marker is written. Multi-instance coordination remains outside the scope of these changes.
 
 ---
 
@@ -309,9 +322,13 @@ Schema in `migrations/`. Key tables:
 | `attestation_duties` | `(validator_index, epoch)` | inclusion slot/delay, correctness, rewards |
 | `sync_duties` | `(validator_index, slot)` | participated, reward, missed_block |
 | `block_proposals` | `slot` | proposer_index, proposed, rewards |
+| `completed_scans` | `(validator_index, epoch)` | verified completion across applicable components |
+| `beacon_inputs` | `input_key` | durable assignments/mappings and canonical anchors |
+| `live_blocks` / `live_coverage` | slot / `(validator_index, slot)` | recent ancestry and proven processing coverage |
+| `live_jobs` | validator, epoch, slot, component | retry state, dependency root, staged reward response |
 | `instances` | `instance_id` (UUID) | `heartbeat` (for observability only) |
 
-`finalized` bool column on the three duty tables; upserts gate on `WHERE finalized = FALSE`, so finalized rows are immutable.
+`finalized` tracks on-chain finality on the three duty tables. `completed_scans`, keyed by `(validator_index, epoch)`, tracks successful scans across all three stages. Upserts protect completed finalized rows while allowing repair of incomplete ones.
 
 ---
 
@@ -319,7 +336,7 @@ Schema in `migrations/`. Key tables:
 
 ```bash
 cargo build
-cargo test        # 64 unit tests, offline (uses captured block fixtures)
+cargo test        # offline unit tests (uses captured block fixtures)
 cargo clippy --all-targets
 ```
 
@@ -327,13 +344,13 @@ Fixtures live under `testdata/blocks/` — one captured block per fork (phase0 �
 
 ### Integration tests
 
-`scripts/run-integration-tests.sh` spins up an ephemeral Postgres via `docker-compose.test.yml`, picks a random recent finalized epoch + a random proposer subset, and runs the dense-vs-sparse equivalence check and the performance bench against a real beacon node. Copy `.env.test.example` to `.env.test` and set `BEACON_URL` first; pin `TEST_EPOCH` / `TEST_VALIDATORS` there to reproduce a specific run. Both tests are `#[ignore]`d in `cargo test` since they need beacon + DB access.
+`scripts/run-integration-tests.sh` spins up an ephemeral Postgres via `docker-compose.test.yml`, picks a random recent finalized epoch + a random proposer subset, and runs the dense-vs-sparse equivalence check and the performance bench against a real beacon node. Copy `.env.test.example` to `.env.test` and set `BEACON_URL` first; pin `TEST_EPOCH` / `TEST_VALIDATORS` there to reproduce a specific run. Both tests are `#[ignore]`d in `cargo test` since they need beacon + DB access. The recovery tests need only a fresh disposable PostgreSQL database: set `RECOVERY_TEST_DATABASE_URL` and run `cargo test -- --ignored --skip dense_sparse_attestation_rows_match --skip dense_vs_sparse_perf_bench`. These cover partial scans, finality boundaries, reorg cleanup, and a mock beacon node with unavailable historical state.
 
 ### Key invariants (before touching the scanner / DB)
 
-1. **Backfill must always pass `finalized=true` to `scan_epoch`.** This makes its rows immune to reorg deletes and upsert overwrites.
-2. **Live must pass `finalized=false`** and rely on `db::scanner::finalization::finalize_up_to_epoch` to promote them.
-3. **Every write upsert has `WHERE finalized = FALSE`** — preserve that guard.
+1. **Backfill must always pass `finalized=true` to `scan_epoch`.** Only scan through `chain::finalized_scan_target`; finalized rows are immune to reorg deletes and live overwrites.
+2. **Live writes remain provisional** until stored dependencies connect to finalized ancestry. Coverage and applicable reward jobs must be complete before promotion.
+3. **Upserts protect completed finalized scans.** Incomplete finalized rows remain repairable; live writes cannot replace finalized rows.
 4. **Reorg deletes only match `finalized = FALSE`.** Same reasoning.
 5. **Malformed data is always fatal to the epoch**, never silently tolerated. See `Error::InconsistentBeaconData`.
 
