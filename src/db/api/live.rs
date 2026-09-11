@@ -7,23 +7,35 @@ use sqlx::Row;
 use crate::db::Pool;
 use crate::error::Result;
 
-/// `(validator, slot) -> (included, finalized)`.
+/// `(validator, slot) -> (included, inclusion_known)`.
 pub type AttestationStatusMap = HashMap<(u64, u64), (bool, bool)>;
 /// `(validator, slot) -> (participated, missed_block)`.
 pub type SyncStatusMap = HashMap<(u64, u64), (bool, bool)>;
 /// `slot -> (proposer, proposed)`.
 pub type ProposalStatusMap = HashMap<u64, (u64, bool)>;
 
-/// Lowest `last_scanned_epoch` among the tracked validators. `None` means no
-/// tracked validator has a watermark yet.
-pub async fn min_tracked_scanned_epoch(pool: &Pool, tracked: &[i64]) -> Result<Option<u64>> {
-    let row = sqlx::query(
-        "SELECT MIN(last_scanned_epoch) AS m FROM validators WHERE validator_index = ANY($1)",
+/// Only processed ancestry can establish a skipped slot; a slot API 404 alone
+/// could also mean unavailable data or a fork-choice race.
+pub async fn fetch_block_presence(
+    pool: &Pool,
+    tracked: &[i64],
+    start: u64,
+    end: u64,
+) -> Result<HashMap<u64, bool>> {
+    let rows: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT DISTINCT c.slot,b.root IS NOT NULL
+        FROM live_coverage c LEFT JOIN live_blocks b ON b.slot=c.slot
+        WHERE c.validator_index=ANY($1) AND c.slot >= $2 AND c.slot < $3",
     )
     .bind(tracked)
-    .fetch_one(pool)
+    .bind(start as i64)
+    .bind(end as i64)
+    .fetch_all(pool)
     .await?;
-    Ok(row.try_get::<Option<i64>, _>("m")?.map(|v| v as u64))
+    Ok(rows
+        .into_iter()
+        .map(|(slot, present)| (slot as u64, present))
+        .collect())
 }
 
 pub async fn fetch_attestation_status(
@@ -34,7 +46,7 @@ pub async fn fetch_attestation_status(
 ) -> Result<AttestationStatusMap> {
     let rows = sqlx::query(
         r#"
-        SELECT validator_index, assigned_slot, included, finalized
+        SELECT validator_index, assigned_slot, included, inclusion_known
         FROM attestation_duties
         WHERE validator_index = ANY($1) AND epoch >= $2 AND epoch <= $3
         "#,
@@ -50,8 +62,8 @@ pub async fn fetch_attestation_status(
         let validator: i64 = row.try_get("validator_index")?;
         let slot: i64 = row.try_get("assigned_slot")?;
         let included: bool = row.try_get("included")?;
-        let finalized: bool = row.try_get("finalized")?;
-        map.insert((slot as u64, validator as u64), (included, finalized));
+        let inclusion_known: bool = row.try_get("inclusion_known")?;
+        map.insert((slot as u64, validator as u64), (included, inclusion_known));
     }
     Ok(map)
 }

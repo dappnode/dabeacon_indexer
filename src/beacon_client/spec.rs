@@ -21,7 +21,6 @@ impl BeaconClient {
             sync_committee_size: spec.sync_committee_size,
             max_committees_per_slot: spec.max_committees_per_slot,
             altair_fork_epoch: spec.altair_fork_epoch,
-            epochs_per_sync_committee_period: spec.epochs_per_sync_committee_period,
             genesis_time: genesis.genesis_time,
         })
     }
@@ -44,11 +43,6 @@ struct SpecResponse {
     max_committees_per_slot: u64,
     #[serde(rename = "ALTAIR_FORK_EPOCH", deserialize_with = "deser_u64_string")]
     altair_fork_epoch: u64,
-    #[serde(
-        rename = "EPOCHS_PER_SYNC_COMMITTEE_PERIOD",
-        deserialize_with = "deser_u64_string"
-    )]
-    epochs_per_sync_committee_period: u64,
 }
 
 #[derive(Deserialize)]

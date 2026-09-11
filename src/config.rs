@@ -10,9 +10,8 @@ pub enum ScanMode {
     /// Fetch every block in the epoch + late window; derive correctness from
     /// attestations vs the canonical chain. Amortises well for 30+ validators.
     Dense,
-    /// Derive correctness from attestation rewards; scan forward block-by-block
-    /// only for duties the rewards show were included. Designed for 1–2 tracked
-    /// validators where the dense flow's per-epoch block fetch is mostly wasted.
+    /// Scan forward per duty and use positive rewards as vote-correct evidence.
+    /// Zero rewards still require inclusion discovery. Best for small scan sets.
     Sparse,
     /// Resolve at startup based on validator count. Default.
     Auto,
@@ -120,6 +119,10 @@ pub struct CliConfig {
     #[arg(long, env = "SCAN_MODE", default_value = "auto")]
     pub scan_mode: String,
 
+    /// Imported slots to wait before collecting live block data.
+    #[arg(long, env = "LIVE_LAG_SLOTS")]
+    pub live_lag_slots: Option<u64>,
+
     /// Base URL of a block explorer used by the web UI for "open in
     /// explorer" links (validators, slots). Path layout follows beaconchain
     /// (`<base>/validator/{idx}` and `<base>/slot/{slot}`). Override per
@@ -194,6 +197,9 @@ pub struct FileConfig {
     #[serde(default)]
     pub scan_mode: Option<String>,
 
+    #[serde(default)]
+    pub live: LiveConfig,
+
     /// Block-explorer base URL surfaced to the web UI.
     #[serde(default)]
     pub explorer_url: Option<String>,
@@ -229,6 +235,7 @@ pub struct Config {
     pub max_backfill_depth: Option<u64>,
     pub non_contiguous_backfill: bool,
     pub scan_mode: ScanMode,
+    pub live: LiveConfig,
     pub validator_indices: Vec<u64>,
     /// Metadata per validator index (from config file)
     pub validator_meta: HashMap<u64, ValidatorMeta>,
@@ -310,6 +317,18 @@ impl Config {
         let scan_mode = ScanMode::parse(&scan_mode_str)?;
 
         let mode = RunMode::parse(&cli.mode)?;
+        let mut live = file_config.live;
+        if let Some(lag) = cli.live_lag_slots {
+            live.lag_slots = lag;
+        }
+        anyhow::ensure!(
+            live.poll_interval_seconds > 0,
+            "live.poll_interval_seconds must be positive"
+        );
+        anyhow::ensure!(
+            live.retry_window_epochs >= 2,
+            "live.retry_window_epochs must be at least 2"
+        );
 
         // CLI `explorer_url` defaults to the literal mainnet URL; treat it as
         // "user-set" only when it differs from the default so the file can
@@ -335,9 +354,29 @@ impl Config {
             max_backfill_depth,
             non_contiguous_backfill,
             scan_mode,
+            live,
             validator_indices,
             validator_meta,
             explorer_url,
         })
+    }
+}
+
+/// Live collection timing is operational tuning, never a substitute for ancestry checks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LiveConfig {
+    pub lag_slots: u64,
+    pub poll_interval_seconds: u64,
+    pub retry_window_epochs: u64,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            lag_slots: 2,
+            poll_interval_seconds: 12,
+            retry_window_epochs: 4,
+        }
     }
 }

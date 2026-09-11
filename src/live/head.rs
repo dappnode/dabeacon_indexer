@@ -13,7 +13,6 @@ use crate::scanner;
 
 const BLOCK_FETCH_RETRIES: u32 = 3;
 const BLOCK_FETCH_RETRY_BASE_DELAY_MS: u64 = 200;
-const INITIAL_SLEEP_MS: u64 = 100;
 
 pub(super) async fn process_head_scan(
     client: &BeaconClient,
@@ -21,161 +20,148 @@ pub(super) async fn process_head_scan(
     scan_validators: &HashSet<u64>,
     head: &HeadEvent,
     last_scanned_slot: &mut Option<u64>,
-    last_rewards_fetched_epoch: &mut Option<u64>,
+    resolved: &ResolvedChain,
+    target_slot: u64,
 ) -> Result<()> {
-    tokio::time::sleep(Duration::from_millis(INITIAL_SLEEP_MS)).await; // give node a chance to process a block
     let scan_started_at = std::time::Instant::now();
-    let head_epoch = slot_to_epoch(head.slot);
-    tracing::debug!(
-        slot = head.slot,
-        head_epoch,
-        block = %head.block,
-        epoch_transition = head.epoch_transition,
-        last_scanned_slot = ?last_scanned_slot,
-        "Head event"
+    let start = last_scanned_slot.map_or(0, |slot| slot.saturating_add(1));
+    let indices: Vec<i64> = scan_validators.iter().map(|v| *v as i64).collect();
+    let mut slots: Vec<u64> = if start <= target_slot {
+        (start..=target_slot).collect()
+    } else {
+        Vec::new()
+    };
+    let resolved_start = resolved.blocks.keys().min().copied().unwrap_or(start);
+    slots.extend(
+        db_scanner::live::missing_coverage_slots(pool, &indices, resolved_start, target_slot, 12)
+            .await?,
     );
-
-    let scan_start_slot = last_scanned_slot.map_or(head.slot, |ls| ls + 1);
-    if scan_start_slot > head.slot {
-        tracing::trace!(slot = head.slot, head_epoch, "No new live slot to process");
-        return Ok(());
-    }
-
-    let blocks_by_slot = resolve_chain(client, head, scan_start_slot).await?;
-    let tracked_indices: Vec<i64> = scan_validators.iter().map(|&v| v as i64).collect();
-
-    let duties =
-        fetch_epoch_duties(client, pool, &tracked_indices, scan_start_slot, head.slot).await?;
-
-    let mut active_by_epoch: HashMap<u64, HashSet<u64>> = HashMap::new();
-    for slot in scan_start_slot..=head.slot {
-        if slot == 0 {
-            continue;
-        }
-        let epoch = slot_to_epoch(slot - 1);
-        if let std::collections::hash_map::Entry::Vacant(e) = active_by_epoch.entry(epoch) {
-            e.insert(
-                db_scanner::validators::active_validators_at(pool, &tracked_indices, epoch as i64)
-                    .await?,
-            );
-        }
-    }
-
-    for slot in scan_start_slot..=head.slot {
-        if slot == 0 {
-            *last_scanned_slot = Some(slot);
-            continue;
-        }
-
-        let target_slot = slot - 1;
-        let epoch = slot_to_epoch(target_slot);
-        tracing::info!(slot, target_slot, head_epoch, epoch, "Processing live slot");
-
-        let block = blocks_by_slot.get(&slot);
-        if let Some(block) = block {
-            let active = &active_by_epoch[&epoch];
-            if !active.is_empty()
-                && let Err(e) =
-                    scanner::scan_live_attestations_in_slot(client, pool, slot, active, Some(block))
-                        .await
-            {
-                tracing::error!(slot, epoch, error = %e, "Live attestation scan failed; aborting");
-                return Err(e);
+    slots.sort_unstable();
+    slots.dedup();
+    // A stale gap must not consume the state-retention window for new blocks.
+    slots.reverse();
+    slots.truncate(32);
+    let mut duties_by_epoch = HashMap::new();
+    let mut active_by_epoch = HashMap::new();
+    for &slot in &slots {
+        let epoch = slot_to_epoch(slot);
+        if let std::collections::hash_map::Entry::Vacant(entry) = duties_by_epoch.entry(epoch) {
+            let duties = fetch_epoch_duties(client, pool, &indices, slot, slot).await;
+            if let Err(error) = &duties {
+                tracing::warn!(epoch, %error, "Epoch assignments unavailable; preserving coverage gap");
             }
-        } else {
-            tracing::trace!(slot, "No canonical block at slot");
+            entry.insert(duties.ok());
+            let mut active =
+                db_scanner::validators::active_validators_at(pool, &indices, epoch as i64).await?;
+            if epoch > 0 {
+                active.extend(
+                    db_scanner::validators::active_validators_at(
+                        pool,
+                        &indices,
+                        (epoch - 1) as i64,
+                    )
+                    .await?,
+                );
+            }
+            active_by_epoch.insert(epoch, active);
         }
-
-        if let Some(&proposer_index) = duties.proposer_by_slot.get(&slot)
-            && let Err(e) =
-                scanner::upsert_live_proposal_in_slot(pool, slot, proposer_index, block).await
-        {
-            tracing::error!(slot, error = %e, "Live proposal scan failed; aborting");
-            return Err(e);
-        }
-
-        let slot_epoch = slot_to_epoch(slot);
-        if let Some(positions) = duties.sync_positions_by_epoch.get(&slot_epoch)
-            && let Err(e) = scanner::upsert_live_sync_in_slot(pool, slot, block, positions).await
-        {
-            tracing::error!(slot, error = %e, "Live sync scan failed; aborting");
-            return Err(e);
-        }
-
-        *last_scanned_slot = Some(slot);
-        crate::metrics::LIVE_LAST_SLOT
-            .with_label_values(&["processed"])
-            .set(slot as i64);
     }
-
+    for slot in slots {
+        let epoch = slot_to_epoch(slot);
+        let Some(duties) = &duties_by_epoch[&epoch] else {
+            continue;
+        };
+        let result = process_slot(
+            client,
+            pool,
+            slot,
+            &indices,
+            &active_by_epoch[&epoch],
+            duties,
+            resolved,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                *last_scanned_slot = Some(last_scanned_slot.map_or(slot, |last| last.max(slot)));
+                crate::metrics::LIVE_LAST_SLOT
+                    .with_label_values(&["processed"])
+                    .set(slot as i64);
+            }
+            Err(error) => tracing::warn!(slot, %error, "Live slot incomplete; retained for retry"),
+        }
+    }
+    crate::metrics::LIVE_LAST_SLOT
+        .with_label_values(&["head_event"])
+        .set(head.slot as i64);
     crate::metrics::LIVE_HEAD_SCAN_DURATION
         .with_label_values(&["total"])
         .observe(scan_started_at.elapsed().as_secs_f64());
+    Ok(())
+}
 
-    // --- Eager epoch-transition reward fetch ---
-    // On every head event, check for completed epochs whose rewards haven't
-    // been fetched yet. Rewards for epoch N are computed during the N→N+1
-    // state transition and are immutable afterwards. However, some beacon
-    // node implementations internally require the state at the END of epoch
-    // N+1 (i.e. the last slot of the next epoch) to serve the rewards API.
-    // We therefore use a 2-epoch lag: rewards for epoch N are fetched once
-    // we enter epoch N+2, guaranteeing the required state exists.
-    let current_epoch = slot_to_epoch(head.slot);
-    if current_epoch >= 2 {
-        let latest_fetchable = current_epoch - 2;
-        let fetch_from = last_rewards_fetched_epoch
-            .map(|e| e + 1)
-            .unwrap_or(latest_fetchable);
-
-        // Cap how far back we reach — non-archival nodes prune states
-        // aggressively so anything older than a few epochs is unlikely to
-        // be available. Trying stale epochs just wastes time.
-        let capped_from = fetch_from.max(latest_fetchable.saturating_sub(2));
-
-        if capped_from > fetch_from {
-            tracing::debug!(
-                skipped_from = fetch_from,
-                starting_from = capped_from,
-                "Skipping old epochs unlikely to have state on non-archival node"
-            );
-        }
-
-        let reward_tracked_indices: Vec<i64> = scan_validators.iter().map(|&v| v as i64).collect();
-        for epoch in capped_from..=latest_fetchable {
-            let active =
-                db_scanner::validators::active_validators_at(pool, &reward_tracked_indices, epoch as i64)
-                    .await?;
-            if active.is_empty() {
-                *last_rewards_fetched_epoch = Some(epoch);
-                continue;
-            }
-            match scanner::process_epoch_rewards(client, pool, epoch, &active, head.slot)
-                .await
-            {
-                Ok(()) => {
-                    *last_rewards_fetched_epoch = Some(epoch);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        epoch,
-                        error = %e,
-                        "Eager reward fetch failed; \
-                         skipping epoch, will rely on finalization fallback"
-                    );
-                    crate::metrics::LIVE_EPOCHS_INCOMPLETE.inc();
-                    // Advance past the failed epoch so we don't retry it
-                    // on every head event. Newer epochs are more likely to
-                    // still have state available on non-archival nodes.
-                    *last_rewards_fetched_epoch = Some(epoch);
-                }
-            }
+async fn process_slot(
+    client: &BeaconClient,
+    pool: &PgPool,
+    slot: u64,
+    tracked_indices: &[i64],
+    active: &HashSet<u64>,
+    duties: &EpochDuties,
+    resolved: &ResolvedChain,
+) -> Result<()> {
+    let block = resolved.blocks.get(&slot);
+    let epoch = slot_to_epoch(slot);
+    if let Some(block) = block {
+        // Save ancestry before any outcome; even a partially failed scan must
+        // remain identifiable and removable if its branch is later orphaned.
+        let root = &resolved.roots[&slot];
+        db_scanner::live::record_block(pool, slot, root, block.parent_root()).await?;
+    }
+    if let Some(&proposer) = duties.proposer_by_slot.get(&slot) {
+        scanner::upsert_live_proposal_in_slot(pool, slot, proposer, block).await?;
+        if block.is_some() {
+            db_scanner::live::enqueue_jobs(
+                pool,
+                epoch,
+                Some(slot),
+                "proposal_rewards",
+                &[proposer as i64],
+                Some(&resolved.roots[&slot]),
+            )
+            .await?;
         }
     }
-
+    if let Some(positions) = duties.sync_positions_by_epoch.get(&epoch) {
+        scanner::upsert_live_sync_in_slot(pool, slot, block, positions).await?;
+        if block.is_some_and(|block| block.sync_aggregate().is_some()) {
+            let members: Vec<i64> = positions.keys().map(|v| *v as i64).collect();
+            db_scanner::live::enqueue_jobs(
+                pool,
+                epoch,
+                Some(slot),
+                "sync_rewards",
+                &members,
+                Some(&resolved.roots[&slot]),
+            )
+            .await?;
+        }
+    }
+    if let Some(block) = block
+        && !active.is_empty()
+    {
+        scanner::scan_live_attestations_in_slot(client, pool, slot, active, Some(block)).await?;
+    }
+    if !duties.complete {
+        return Err(crate::error::Error::InconsistentBeaconData(
+            "Assignments incomplete; retaining slot coverage gap".into(),
+        ));
+    }
+    db_scanner::live::record_coverage(pool, tracked_indices, slot).await?;
     Ok(())
 }
 
 struct EpochDuties {
+    complete: bool,
     /// slot -> validator_index for tracked validators scheduled to propose.
     proposer_by_slot: HashMap<u64, u64>,
     /// epoch -> (validator_index -> sync-committee positions).
@@ -196,6 +182,7 @@ async fn fetch_epoch_duties(
     epochs.sort_unstable();
     epochs.dedup();
 
+    let mut complete = true;
     let mut proposer_by_slot: HashMap<u64, u64> = HashMap::new();
     let mut sync_positions_by_epoch: HashMap<u64, HashMap<u64, Vec<u64>>> = HashMap::new();
 
@@ -206,129 +193,169 @@ async fn fetch_epoch_duties(
         if active.is_empty() {
             continue;
         }
+        if let Err(error) =
+            scanner::seed_live_attestation_duties(client, pool, epoch, &active).await
+        {
+            tracing::debug!(epoch, %error, "Attestation assignments pending");
+            complete = false;
+        }
         let active_indices: Vec<u64> = active.iter().copied().collect();
-
-        for d in client.get_proposer_duties(epoch).await? {
-            if active.contains(&d.validator_index) {
-                proposer_by_slot.insert(d.slot, d.validator_index);
+        match client.get_proposer_duties(epoch).await {
+            Ok(duties) => {
+                for duty in duties {
+                    if active.contains(&duty.validator_index) {
+                        proposer_by_slot.insert(duty.slot, duty.validator_index);
+                    }
+                }
+            }
+            Err(error) => {
+                complete = false;
+                tracing::debug!(epoch, %error, "Proposer assignments pending");
             }
         }
-
-        let sync = client.get_sync_duties(epoch, &active_indices).await?;
-        let positions: HashMap<u64, Vec<u64>> = sync
-            .into_iter()
-            .map(|d| {
-                (
-                    d.validator_index,
-                    d.validator_sync_committee_indices
-                        .iter()
-                        .map(|i| i.0)
-                        .collect(),
-                )
-            })
-            .collect();
-        sync_positions_by_epoch.insert(epoch, positions);
-    }
-
-    Ok(EpochDuties {
-        proposer_by_slot,
-        sync_positions_by_epoch,
-    })
-}
-
-/// Build `slot -> block` for `[scan_start_slot, head.slot]` on the canonical
-/// chain rooted at `head.block`. Prefers root-based walks (stable under
-/// fork-choice churn); falls back to slot lookups on failure.
-async fn resolve_chain(
-    client: &BeaconClient,
-    head: &HeadEvent,
-    scan_start_slot: u64,
-) -> Result<HashMap<u64, SignedBeaconBlock>> {
-    let mut blocks_by_slot: HashMap<u64, SignedBeaconBlock> = HashMap::new();
-
-    let mut cursor = fetch_by_root(client, &head.block).await?;
-    if cursor.is_none() {
-        tracing::warn!(
-            head_slot = head.slot,
-            head_block = %head.block,
-            "Head block unavailable by root after retries; falling back to slot lookup"
-        );
-        cursor = fetch_by_slot(client, head.slot).await?;
-    }
-
-    while let Some(block) = cursor {
-        let slot = block.slot();
-        if slot < scan_start_slot {
-            break;
-        }
-        let parent_root = block.parent_root().clone();
-        blocks_by_slot.insert(slot, block);
-        if slot == 0 || slot == scan_start_slot {
-            break;
-        }
-
-        match fetch_by_root(client, &parent_root).await? {
-            Some(parent) => cursor = Some(parent),
-            None => {
-                tracing::debug!(
-                    child_slot = slot,
-                    parent_root = %parent_root,
-                    "Parent block unavailable by root; walking backwards by slot"
-                );
-                cursor = None;
-                for fb_slot in (scan_start_slot..slot).rev() {
-                    if let Some(b) = fetch_by_slot(client, fb_slot).await? {
-                        cursor = Some(b);
-                        break;
-                    }
+        if epoch >= crate::chain::altair_epoch() {
+            match client.get_sync_duties(epoch, &active_indices).await {
+                Ok(duties) => {
+                    let positions = duties
+                        .into_iter()
+                        .map(|duty| {
+                            (
+                                duty.validator_index,
+                                duty.validator_sync_committee_indices
+                                    .iter()
+                                    .map(|index| index.0)
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    sync_positions_by_epoch.insert(epoch, positions);
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::debug!(epoch, %error, "Sync assignments pending");
                 }
             }
         }
     }
 
-    // Final safety net: direct slot lookup for any slot still missing.
-    for slot in scan_start_slot..=head.slot {
-        if slot == 0 || blocks_by_slot.contains_key(&slot) {
-            continue;
-        }
-        if let Some(b) = fetch_by_slot(client, slot).await? {
-            blocks_by_slot.insert(slot, b);
-        }
-    }
-
-    Ok(blocks_by_slot)
+    Ok(EpochDuties {
+        complete,
+        proposer_by_slot,
+        sync_positions_by_epoch,
+    })
 }
 
-/// A 404 by root is never a "missed slot" — the root names a specific block.
-/// Retry to absorb transient "node hasn't processed yet" cases.
-async fn fetch_by_root(
+/// Every missing slot in this range is proven by an actual parent link.
+/// Missing a named root is an unresolved chain, never proof of a skipped slot.
+pub(super) struct ResolvedChain {
+    pub blocks: HashMap<u64, SignedBeaconBlock>,
+    pub roots: HashMap<u64, BlockRoot>,
+}
+
+pub(super) async fn resolve_chain(
     client: &BeaconClient,
-    root: &BlockRoot,
-) -> Result<Option<SignedBeaconBlock>> {
+    head: &HeadEvent,
+    scan_start_slot: u64,
+) -> Result<ResolvedChain> {
+    let mut chain = ResolvedChain {
+        blocks: HashMap::new(),
+        roots: HashMap::new(),
+    };
+    let mut root = head.block.clone();
+    let mut child_slot = None;
+    loop {
+        let block = fetch_by_root(client, &root).await?;
+        let slot = block.slot();
+        if child_slot.is_none() && slot != head.slot {
+            return Err(crate::error::Error::InconsistentBeaconData(
+                "Head root and slot disagree".into(),
+            ));
+        }
+        if child_slot.is_some_and(|child| slot >= child) {
+            return Err(crate::error::Error::InconsistentBeaconData(
+                "Parent slot does not precede child".into(),
+            ));
+        }
+        let parent = block.parent_root().clone();
+        chain.roots.insert(slot, root);
+        chain.blocks.insert(slot, block);
+        if slot <= scan_start_slot {
+            break;
+        }
+        child_slot = Some(slot);
+        root = parent;
+    }
+    Ok(chain)
+}
+
+async fn fetch_by_root(client: &BeaconClient, root: &BlockRoot) -> Result<SignedBeaconBlock> {
     for attempt in 1..=BLOCK_FETCH_RETRIES {
-        if let Some(b) = client.get_block(root).await?.0 {
-            return Ok(Some(b));
+        if let Some(block) = client.get_block(root).await?.0 {
+            return Ok(block);
         }
         if attempt < BLOCK_FETCH_RETRIES {
-            let delay = BLOCK_FETCH_RETRY_BASE_DELAY_MS * attempt as u64;
-            tracing::debug!(
-                root = %root,
-                attempt,
-                delay_ms = delay,
-                "Block not found by root; retrying"
-            );
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            tokio::time::sleep(Duration::from_millis(
+                BLOCK_FETCH_RETRY_BASE_DELAY_MS * u64::from(attempt),
+            ))
+            .await;
         }
     }
-    Ok(None)
+    Err(crate::error::Error::InconsistentBeaconData(format!(
+        "Named block {root} unavailable; ancestry remains unresolved"
+    )))
 }
 
-/// 404 by slot is legitimate (missed slot); retry just once to absorb brief
-/// fork-choice races near the head.
-async fn fetch_by_slot(client: &BeaconClient, slot: u64) -> Result<Option<SignedBeaconBlock>> {
-    if let Some(b) = client.get_block(slot).await?.0 {
-        return Ok(Some(b));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::Request, http::StatusCode, response::IntoResponse};
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn parent_root_gap_never_imports_competing_slot_block() {
+        let h = format!("0x{}", "11".repeat(32));
+        let p = format!("0x{}", "22".repeat(32));
+        let x = format!("0x{}", "33".repeat(32));
+        let head: HeadEvent =
+            serde_json::from_value(json!({"slot":"102", "block": h, "epoch_transition":false}))
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BeaconClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let router = Router::new().fallback(move |req: Request| {
+            let (h, p, x) = (h.clone(), p.clone(), x.clone());
+            async move {
+                let path = req.uri().path();
+                if path == "/eth/v1/beacon/blocks/101/root" {
+                    return Json(json!({"data":{"root":x},"finalized":false})).into_response();
+                }
+                let slot = if path == format!("/eth/v2/beacon/blocks/{h}") {
+                    102
+                } else if path == format!("/eth/v2/beacon/blocks/{p}") {
+                    100
+                } else if path == "/eth/v2/beacon/blocks/101" {
+                    101
+                } else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let mut block: Value =
+                    serde_json::from_str(include_str!("../../testdata/blocks/phase0.json"))
+                        .unwrap();
+                block["data"]["message"]["slot"] = json!(slot.to_string());
+                block["data"]["message"]["parent_root"] = json!(p);
+                block["finalized"] = json!(false);
+                Json(block).into_response()
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let blocks = resolve_chain(&client, &head, 100).await.unwrap();
+        assert_eq!(blocks.blocks[&102].parent_root(), &head_parent());
+        // H directly descends from slot 100: slot 101 is absent on H's branch.
+        // No direct slot lookup may insert a competing block there.
+        assert!(!blocks.blocks.contains_key(&101));
+        assert_eq!(blocks.blocks.len(), 2);
+        server.abort();
     }
-    tokio::time::sleep(Duration::from_millis(BLOCK_FETCH_RETRY_BASE_DELAY_MS)).await;
-    Ok(client.get_block(slot).await?.0)
+    fn head_parent() -> BlockRoot {
+        serde_json::from_value(json!(format!("0x{}", "22".repeat(32)))).unwrap()
+    }
 }

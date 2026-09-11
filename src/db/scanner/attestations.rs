@@ -15,9 +15,8 @@ pub type RewardTuple = (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<
 /// the head tracker already wrote (whose `ON CONFLICT` upsert would reject a
 /// full row write due to the `inclusion_slot` guard).
 ///
-/// Updates rows where rewards are NULL (head tracker wrote inclusion but not
-/// rewards) or where rewards are all zero but the new data says otherwise
-/// (a stale early fetch wrote 0s before the attestation was actually included).
+/// The caller verifies chain dependencies first. Valid replacements may change
+/// any reward, including nonzero to zero following a reorg; final rows are frozen.
 pub async fn update_attestation_rewards_batch(pool: &Pool, rewards: &[RewardTuple]) -> Result<()> {
     if rewards.is_empty() {
         return Ok(());
@@ -45,15 +44,15 @@ pub async fn update_attestation_rewards_batch(pool: &Pool, rewards: &[RewardTupl
             source_reward = v.source_reward,
             target_reward = v.target_reward,
             head_reward = v.head_reward,
-            inactivity_penalty = v.inactivity_penalty
+            inactivity_penalty = v.inactivity_penalty,
+            source_correct = CASE WHEN v.source_reward > 0 THEN TRUE ELSE ad.source_correct END,
+            target_correct = CASE WHEN v.target_reward > 0 THEN TRUE ELSE ad.target_correct END,
+            head_correct = CASE WHEN v.head_reward > 0 THEN TRUE ELSE ad.head_correct END
         FROM UNNEST($1::BIGINT[], $2::BIGINT[], $3::BIGINT[], $4::BIGINT[], $5::BIGINT[], $6::BIGINT[])
             AS v(validator_index, epoch, source_reward, target_reward, head_reward, inactivity_penalty)
         WHERE ad.validator_index = v.validator_index
           AND ad.epoch = v.epoch
           AND ad.finalized = FALSE
-          AND (ad.source_reward IS NULL
-               OR (ad.source_reward = 0 AND ad.target_reward = 0 AND ad.head_reward = 0
-                   AND (COALESCE(v.source_reward, 0) != 0 OR COALESCE(v.target_reward, 0) != 0 OR COALESCE(v.head_reward, 0) != 0)))
         "#,
     )
     .bind(&validator_indices)
@@ -68,17 +67,8 @@ pub async fn update_attestation_rewards_batch(pool: &Pool, rewards: &[RewardTupl
     Ok(())
 }
 
-/// Upsert one attestation duty row. The `ON CONFLICT` clause enforces two
-/// invariants:
-///
-/// 1. **Finalized rows are immutable** — a live head-tracker (`finalized=false`)
-///    can never overwrite an archive backfiller's (`finalized=true`) output.
-/// 2. **Reward backfill is allowed** — a finalized row that was promoted
-///    without rewards (state was pruned when finalization fired) CAN be
-///    overwritten by a subsequent finalized write (archive backfill) that
-///    carries reward data. This lets `--non-contiguous-backfill` fill gaps.
-///
-/// See [`crate::scanner::scan_epoch`] for the wider cross-instance invariant.
+/// Live writes cannot replace finalized rows. An authoritative finalized scan
+/// may replace rows until all scan stages have completed for this validator.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_attestation_duty(
     pool: &Pool,
@@ -111,17 +101,20 @@ pub async fn upsert_attestation_duty(
             finalized
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
         ON CONFLICT (validator_index, epoch) DO UPDATE SET
+            assigned_slot = EXCLUDED.assigned_slot,
+            committee_index = EXCLUDED.committee_index,
+            committee_position = EXCLUDED.committee_position,
             included = EXCLUDED.included,
             inclusion_slot = EXCLUDED.inclusion_slot,
             inclusion_delay = EXCLUDED.inclusion_delay,
             effective_inclusion_delay = EXCLUDED.effective_inclusion_delay,
-            source_correct = EXCLUDED.source_correct,
-            target_correct = EXCLUDED.target_correct,
-            head_correct = EXCLUDED.head_correct,
-            source_reward = EXCLUDED.source_reward,
-            target_reward = EXCLUDED.target_reward,
-            head_reward = EXCLUDED.head_reward,
-            inactivity_penalty = EXCLUDED.inactivity_penalty,
+            source_correct = COALESCE(EXCLUDED.source_correct, attestation_duties.source_correct),
+            target_correct = COALESCE(EXCLUDED.target_correct, attestation_duties.target_correct),
+            head_correct = COALESCE(EXCLUDED.head_correct, attestation_duties.head_correct),
+            source_reward = COALESCE(EXCLUDED.source_reward, attestation_duties.source_reward),
+            target_reward = COALESCE(EXCLUDED.target_reward, attestation_duties.target_reward),
+            head_reward = COALESCE(EXCLUDED.head_reward, attestation_duties.head_reward),
+            inactivity_penalty = COALESCE(EXCLUDED.inactivity_penalty, attestation_duties.inactivity_penalty),
             finalized = EXCLUDED.finalized
         WHERE
           -- Path 1: non-finalized row can be updated by finalized writes
@@ -132,10 +125,12 @@ pub async fn upsert_attestation_duty(
              OR attestation_duties.inclusion_slot IS NULL
              OR EXCLUDED.inclusion_slot < attestation_duties.inclusion_slot
            ))
-          -- Path 2: finalized row with missing rewards can be backfilled.
+          -- Path 2: an incomplete finalized scan can be repaired.
           -- Only finalized writes (archive backfill) are allowed here.
           OR (EXCLUDED.finalized = TRUE
-              AND attestation_duties.source_reward IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM completed_scans c
+                  WHERE c.validator_index = attestation_duties.validator_index
+                    AND c.epoch = attestation_duties.epoch))
         "#,
     )
     .bind(validator_index)
@@ -171,10 +166,10 @@ pub async fn upsert_attestation_duty(
     Ok(())
 }
 
-/// Return the subset of `validator_indices` that already have a finalized
-/// attestation_duties row for `epoch`. Used by non-contiguous backfill to skip
+/// Return the subset of `validator_indices` that already have a completed
+/// scan for `epoch`. Used by non-contiguous backfill to skip
 /// `(validator, epoch)` pairs that are already covered.
-pub async fn validators_with_finalized_attestation(
+pub async fn validators_with_completed_scan(
     pool: &Pool,
     validator_indices: &[i64],
     epoch: i64,
@@ -185,8 +180,8 @@ pub async fn validators_with_finalized_attestation(
     let rows = sqlx::query(
         r#"
         SELECT validator_index
-        FROM attestation_duties
-        WHERE validator_index = ANY($1) AND epoch = $2 AND finalized = TRUE
+        FROM completed_scans
+        WHERE validator_index = ANY($1) AND epoch = $2
         "#,
     )
     .bind(validator_indices)
@@ -226,7 +221,7 @@ pub async fn count_covered_validator_epochs(
         )
         SELECT COUNT(*)
         FROM requested_ranges AS r
-        JOIN attestation_duties AS ad
+        JOIN completed_scans AS ad
           ON ad.validator_index = r.validator_index
          AND ad.epoch >= r.from_epoch
          AND ad.epoch <= r.to_epoch
@@ -238,4 +233,86 @@ pub async fn count_covered_validator_epochs(
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod live_join_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn pending_seed_and_later_inclusion_preserve_collected_rewards() {
+        let pool = crate::db::isolated_test_pool().await;
+        let validator = 99101;
+        let epoch = 9001;
+        super::super::validators::upsert_validator(&pool, validator, &[99, 101], 0, None)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM attestation_duties WHERE validator_index=$1")
+            .bind(validator)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Seed, collect rewards, then repeat the seed before any inclusion.
+        write(&pool, validator, epoch, None).await;
+        update_attestation_rewards_batch(
+            &pool,
+            &[(validator, epoch, Some(10), Some(20), Some(5), Some(0))],
+        )
+        .await
+        .unwrap();
+        write(&pool, validator, epoch, None).await;
+        assert_row(&pool, validator, false, None, 10).await;
+        // A later inclusion and a repeated pending seed cannot erase the evidence.
+        write(&pool, validator, epoch, Some(epoch * 32 + 2)).await;
+        write(&pool, validator, epoch, None).await;
+        assert_row(&pool, validator, true, Some(epoch * 32 + 2), 10).await;
+        // A chain-validated replacement can legitimately change a positive reward to zero.
+        update_attestation_rewards_batch(
+            &pool,
+            &[(validator, epoch, Some(0), Some(0), Some(0), Some(-1))],
+        )
+        .await
+        .unwrap();
+        assert_row(&pool, validator, true, Some(epoch * 32 + 2), 0).await;
+        pool.close().await;
+    }
+
+    async fn write(pool: &Pool, validator: i64, epoch: i64, inclusion: Option<i64>) {
+        upsert_attestation_duty(
+            pool,
+            validator,
+            epoch,
+            epoch * 32 + 1,
+            0,
+            0,
+            inclusion.is_some(),
+            inclusion,
+            inclusion.map(|_| 1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn assert_row(
+        pool: &Pool,
+        validator: i64,
+        included: bool,
+        inclusion: Option<i64>,
+        reward: i64,
+    ) {
+        let row: (bool, Option<i64>, i64) = sqlx::query_as(
+            "SELECT included, inclusion_slot, source_reward FROM attestation_duties WHERE validator_index=$1",
+        ).bind(validator).fetch_one(pool).await.unwrap();
+        assert_eq!(row, (included, inclusion, reward));
+    }
 }

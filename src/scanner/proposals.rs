@@ -107,8 +107,7 @@ pub async fn process_epoch_proposals(
 }
 
 /// Upsert a block_proposals row for a slot whose scheduled proposer is tracked.
-/// Rewards are deferred to finalization (the block-rewards endpoint can race
-/// with state availability near the head, same as attestation rewards).
+/// Rewards are joined independently by the recent-block reward worker.
 pub async fn upsert_live_proposal_in_slot(
     pool: &PgPool,
     slot: u64,
@@ -124,6 +123,55 @@ pub async fn upsert_live_proposal_in_slot(
         None,
         None,
         None,
+        false,
+    )
+    .await
+}
+
+/// Fetch by the root already resolved by the live chain worker, not a mutable slot.
+pub async fn fetch_live_proposal_rewards(
+    client: &BeaconClient,
+    root: &crate::beacon_client::types::BlockRoot,
+    block: &SignedBeaconBlock,
+) -> Result<crate::beacon_client::types::BeaconResponse<crate::beacon_client::types::BlockRewards>>
+{
+    let response = client.get_block_rewards_by_root(root).await?;
+    if response.data.proposer_index != block.proposer_index() {
+        return Err(crate::error::Error::InconsistentBeaconData(
+            "block reward proposer disagrees with resolved block".into(),
+        ));
+    }
+    Ok(response)
+}
+
+/// Persist only after the caller verifies that the job's block remains canonical.
+pub async fn persist_live_proposal_rewards(
+    pool: &PgPool,
+    slot: u64,
+    rewards: &crate::beacon_client::types::BlockRewards,
+) -> Result<()> {
+    let signed = |value: u64| {
+        i64::try_from(value).map_err(|_| {
+            crate::error::Error::InconsistentBeaconData(
+                "proposal reward exceeds database range".into(),
+            )
+        })
+    };
+    let slashings = rewards
+        .proposer_slashings
+        .checked_add(rewards.attester_slashings)
+        .ok_or_else(|| {
+            crate::error::Error::InconsistentBeaconData("proposal slashing reward overflow".into())
+        })?;
+    db::scanner::proposals::upsert_block_proposal(
+        pool,
+        slot as i64,
+        rewards.proposer_index as i64,
+        true,
+        Some(signed(rewards.total)?),
+        Some(signed(rewards.attestations)?),
+        Some(signed(rewards.sync_aggregate)?),
+        Some(signed(slashings)?),
         false,
     )
     .await

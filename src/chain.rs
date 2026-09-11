@@ -21,7 +21,6 @@ pub struct ChainSpec {
     pub sync_committee_size: u64,
     pub max_committees_per_slot: u64,
     pub altair_fork_epoch: u64,
-    pub epochs_per_sync_committee_period: u64,
     pub genesis_time: u64,
 }
 
@@ -36,7 +35,6 @@ impl ChainSpec {
         sync_committee_size: 512,
         max_committees_per_slot: 64,
         altair_fork_epoch: 74_240,
-        epochs_per_sync_committee_period: 256,
         genesis_time: 1_606_824_023,
     };
 
@@ -83,17 +81,6 @@ pub fn sync_committee_size() -> u64 {
     spec().sync_committee_size
 }
 
-pub fn epochs_per_sync_committee_period() -> u64 {
-    spec().epochs_per_sync_committee_period
-}
-
-/// The sync-committee period that contains `epoch`. Committee composition is
-/// stable for the whole period, so this is the right cache key for
-/// `/eth/v1/beacon/states/.../sync_committees`.
-pub fn sync_committee_period(epoch: u64) -> u64 {
-    epoch / epochs_per_sync_committee_period()
-}
-
 pub fn max_committees_per_slot() -> u64 {
     spec().max_committees_per_slot
 }
@@ -108,4 +95,21 @@ pub fn epoch_start_slot(epoch: u64) -> u64 {
 
 pub fn slot_to_epoch(slot: u64) -> u64 {
     slot / slots_per_epoch()
+}
+
+/// Epoch E may include attestations through the end of E+1. Checkpoint E+2
+/// anchors that entire window, including the state used to compute rewards.
+pub fn finalized_scan_target(checkpoint_epoch: u64) -> Option<u64> {
+    checkpoint_epoch.checked_sub(2)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn finality_covers_the_entire_inclusion_window() {
+        assert_eq!(super::finalized_scan_target(0), None);
+        assert_eq!(super::finalized_scan_target(1), None);
+        assert_eq!(super::finalized_scan_target(2), Some(0));
+        assert_eq!(super::finalized_scan_target(100), Some(98));
+    }
 }

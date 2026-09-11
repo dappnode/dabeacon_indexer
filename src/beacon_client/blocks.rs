@@ -18,7 +18,17 @@ impl BeaconClient {
             Err(e) => return Err(e),
         };
 
-        let raw: RawBlockResponse = response.json().await.map_err(Error::Http)?;
+        let value: serde_json::Value = response.json().await.map_err(Error::Http)?;
+        if value
+            .get("execution_optimistic")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(Error::InconsistentBeaconData(
+                "execution-optimistic block".into(),
+            ));
+        }
+        let raw: RawBlockResponse = serde_json::from_value(value)?;
         let (block, finalized) = raw.into_parts();
         Ok((Some(block), finalized))
     }
@@ -67,8 +77,19 @@ impl BeaconClient {
                     crate::metrics::record_cache("root_block", false);
                 }
 
-                let slot_id = BlockId::Slot(slot);
-                let (block, is_finalized) = self.get_block_with_finalized(&slot_id).await?;
+                // Pin the block request to the root we just resolved. Two slot
+                // requests can otherwise straddle a reorg and poison the cache.
+                let Some(ref root) = slot_root else {
+                    return Ok((None, false));
+                };
+                let (block, is_finalized) = self
+                    .get_block_with_finalized(&BlockId::Root(root.clone()))
+                    .await?;
+                if block.as_ref().is_some_and(|block| block.slot() != slot) {
+                    return Err(Error::InconsistentBeaconData(
+                        "block slot disagrees with root lookup".into(),
+                    ));
+                }
 
                 if let Some(ref fetched_block) = block {
                     if let Some(root) = slot_root {
@@ -152,7 +173,17 @@ impl BeaconClient {
             Err(e) => return Err(e),
         };
 
-        let raw: RawBlockRootResponse = response.json().await.map_err(Error::Http)?;
+        let value: serde_json::Value = response.json().await.map_err(Error::Http)?;
+        if value
+            .get("execution_optimistic")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(Error::InconsistentBeaconData(
+                "execution-optimistic block root".into(),
+            ));
+        }
+        let raw: RawBlockRootResponse = serde_json::from_value(value)?;
         let root = raw.data.root;
 
         if raw.finalized

@@ -21,3 +21,10 @@ tags = ["pool-a", "node-2"]
 [[validators]]
 index = 789
 tags = ["pool-b", "node-1"]
+
+# Live block collection waits for imported head progress; attestation rewards use E+2.
+# Two slots is an initial operational default, not a measured client guarantee.
+[live]
+lag_slots = 2
+poll_interval_seconds = 12
+retry_window_epochs = 4

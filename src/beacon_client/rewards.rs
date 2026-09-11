@@ -35,3 +35,39 @@ impl BeaconClient {
             .await
     }
 }
+
+impl BeaconClient {
+    pub async fn get_attestation_rewards_response(
+        &self,
+        epoch: u64,
+        validator_indices: &[u64],
+    ) -> Result<super::types::BeaconResponse<AttestationRewardsResponse>> {
+        let body: Vec<String> = validator_indices.iter().map(u64::to_string).collect();
+        self.post_metadata(
+            &format!("/eth/v1/beacon/rewards/attestations/{epoch}"),
+            &body,
+        )
+        .await
+    }
+
+    pub async fn get_block_rewards_by_root(
+        &self,
+        root: &super::types::BlockRoot,
+    ) -> Result<super::types::BeaconResponse<BlockRewards>> {
+        self.get_metadata(&format!("/eth/v1/beacon/rewards/blocks/{root}"))
+            .await
+    }
+
+    pub async fn get_sync_committee_rewards_by_root(
+        &self,
+        root: &super::types::BlockRoot,
+        validator_indices: &[u64],
+    ) -> Result<super::types::BeaconResponse<Vec<SyncCommitteeReward>>> {
+        let body: Vec<String> = validator_indices.iter().map(u64::to_string).collect();
+        self.post_metadata(
+            &format!("/eth/v1/beacon/rewards/sync_committee/{root}"),
+            &body,
+        )
+        .await
+    }
+}

@@ -28,6 +28,23 @@ mod integration_tests;
 pub use dense::process_epoch_attestation_duties;
 pub use sparse::process_epoch_attestation_duties_sparse;
 
+/// Missing duties or rewards must remain repairable, not become a completed scan.
+fn validate_epoch_response(
+    tracked: &HashSet<u64>,
+    duties: &[crate::beacon_client::types::AttesterDuty],
+    rewards: &HashMap<u64, crate::beacon_client::types::ValidatorAttestationReward>,
+) -> Result<()> {
+    let assigned: HashSet<u64> = duties.iter().map(|d| d.validator_index).collect();
+    for validator in tracked {
+        if !assigned.contains(validator) || !rewards.contains_key(validator) {
+            return Err(Error::InconsistentBeaconData(format!(
+                "missing attestation duty or reward for validator {validator}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The canonical chain context needed to verify attestation vote correctness.
 pub(super) struct VoteContext {
     /// Canonical block root at each slot in the epoch.
@@ -194,17 +211,16 @@ pub async fn scan_live_attestations_in_slot(
 
         let mut updated = 0u32;
         for (&validator_index, inc) in &inclusions {
-            let Some(duty) = duties_map.get(&validator_index) else {
-                tracing::trace!(
-                    validator_index,
-                    epoch,
-                    "No duty found for included validator"
-                );
-                continue;
-            };
+            let duty = duties_map.get(&validator_index).ok_or_else(|| {
+                Error::InconsistentBeaconData(format!(
+                    "missing duty for observed validator {validator_index} in epoch {epoch}"
+                ))
+            })?;
 
             if duty.slot < min_att_slot || duty.slot > max_att_slot {
-                continue;
+                return Err(Error::InconsistentBeaconData(format!(
+                    "duty outside inclusion window for validator {validator_index}"
+                )));
             }
 
             db::scanner::attestations::upsert_attestation_duty(
@@ -217,11 +233,9 @@ pub async fn scan_live_attestations_in_slot(
                 true,
                 Some(inc.inclusion_slot as i64),
                 Some(inc.inclusion_delay as i32),
-                // Live path doesn't know which intervening slots were missed. Write the
-                // raw delay as an optimistic placeholder so UIs filtering on effective
-                // delay still see the row; the finalized scan_epoch pass overwrites with
-                // the chain-level-adjusted value.
-                Some(inc.inclusion_delay as i32),
+                // Intervening missed slots are not available in this function.
+                // Leave the adjusted delay unknown until coverage can derive it.
+                None,
                 None,
                 None,
                 None,

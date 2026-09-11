@@ -25,11 +25,9 @@
 //! [`dense_sparse_attestation_rows_match`] runs both modes against the
 //! same `(epoch, validators)`, snapshots the resulting
 //! `attestation_duties` rows, and compares field-by-field. Numeric and
-//! reward fields must match exactly. The `*_correct` fields are
-//! **expected** to differ on late inclusions (sparse uses
-//! reward-eligibility semantics — head requires delay==1, source
-//! requires delay≤5 — while dense uses pure vote correctness); the test
-//! reports those without failing.
+//! reward fields must match exactly. Both modes use vote correctness; sparse
+//! can leave a flag unknown when a non-positive reward cannot establish whether
+//! the vote was correct. Every known sparse flag must agree with dense.
 //!
 //! # Performance benchmark
 //!
@@ -180,12 +178,8 @@ async fn seed_validators(client: &BeaconClient, pool: &db::Pool, validators: &[u
     }
 }
 
-/// Equivalence: dense and sparse must agree on every field except
-/// `*_correct`, which has documented semantic differences (sparse
-/// encodes reward-eligibility, dense encodes raw vote correctness).
-///
-/// Numeric and reward fields are asserted; `*_correct` mismatches are
-/// reported but tolerated.
+/// Equivalence: numeric/reward fields agree exactly. Sparse may leave vote
+/// correctness unknown, but a known sparse flag must agree with dense.
 #[tokio::test]
 #[ignore = "requires BEACON_URL, DATABASE_URL, TEST_EPOCH, TEST_VALIDATORS env vars"]
 async fn dense_sparse_attestation_rows_match() {
@@ -297,8 +291,19 @@ async fn dense_sparse_attestation_rows_match() {
             format!("{:?}", s.inactivity_penalty),
         );
 
-        // Soft equality — *_correct differs by definition for late
-        // inclusions. Report but don't fail.
+        for (field, dense, sparse) in [
+            ("source_correct", d.source_correct, s.source_correct),
+            ("target_correct", d.target_correct, s.target_correct),
+            ("head_correct", d.head_correct, s.head_correct),
+        ] {
+            hard(
+                field,
+                sparse.is_none() || dense == sparse,
+                format!("{dense:?}"),
+                format!("{sparse:?}"),
+            );
+        }
+        // Unknown sparse flags can be refined by dense canonical vote context.
         let mut soft = |field: &str, eq: bool, dense_v: String, sparse_v: String| {
             if !eq {
                 soft_diffs.push(format!(
@@ -328,7 +333,7 @@ async fn dense_sparse_attestation_rows_match() {
 
     if !soft_diffs.is_empty() {
         eprintln!(
-            "\n{} *_correct differences (expected on late inclusions):",
+            "\n{} *_correct differences (sparse unknown flags refined by dense):",
             soft_diffs.len()
         );
         for d in &soft_diffs {

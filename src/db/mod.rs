@@ -23,3 +23,28 @@ pub async fn connect(database_url: &str) -> Result<Pool> {
 
     Ok(pool)
 }
+
+#[cfg(test)]
+pub async fn isolated_test_pool() -> Pool {
+    let url =
+        std::env::var("RECOVERY_TEST_DATABASE_URL").expect("disposable test database required");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let schema = format!("recovery_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.options([("search_path", schema.as_str())]))
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    admin.close().await;
+    pool
+}

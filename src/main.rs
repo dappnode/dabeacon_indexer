@@ -54,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let pool = db::connect(&config.database_url).await?;
-    let live_client = Arc::new(beacon_client::BeaconClient::new(&config.beacon_url));
+    let live_client =
+        Arc::new(beacon_client::BeaconClient::new(&config.beacon_url).with_pool(pool.clone()));
 
     // Load chain config from the live node before anything else touches the
     // `chain::` accessors (scanner pipeline, backfill probe, web-SSE handler).
@@ -73,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
         "Loaded chain spec from beacon node"
     );
     chain::init(chain_spec);
+    anyhow::ensure!(
+        config.live.lag_slots < chain::epoch_start_slot(config.live.retry_window_epochs),
+        "live lag must fit inside retry window"
+    );
 
     // Separate client for backfill when a dedicated URL is configured (typical:
     // archive node for backfill, non-archive for live). Otherwise share.
@@ -163,14 +168,16 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(count = needs_backfill, "Validators need backfill");
     }
 
-    let f0 = live_client
+    let checkpoint_epoch = live_client
         .get_finality_checkpoints("head")
         .await?
         .finalized
         .epoch;
-    tracing::info!(f0, run_mode = ?config.mode, "Current finality target");
+    let finalized_target = chain::finalized_scan_target(checkpoint_epoch);
+    let f0 = finalized_target.unwrap_or(0);
+    tracing::info!(checkpoint_epoch, finalized_target = ?finalized_target, run_mode = ?config.mode, "Current finality target");
 
-    let mut backfill_should_run = config.mode.runs_backfill();
+    let backfill_should_run = config.mode.runs_backfill() && finalized_target.is_some();
 
     // ─── Gap detection ─────────────────────────────────────────────────────
     // Check whether the DB has attestation_duties rows for each validator's
@@ -200,14 +207,16 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if !coverage_ranges.is_empty() {
-            let from_epoch = coverage_ranges.iter().map(|(_, from, _)| *from).min().unwrap() as u64;
+            let from_epoch = coverage_ranges
+                .iter()
+                .map(|(_, from, _)| *from)
+                .min()
+                .unwrap() as u64;
             let to_epoch = coverage_ranges.iter().map(|(_, _, to)| *to).max().unwrap() as u64;
-            let found = db::scanner::attestations::count_covered_validator_epochs(
-                &pool,
-                &coverage_ranges,
-            )
-            .await
-            .unwrap_or(0) as u64;
+            let found =
+                db::scanner::attestations::count_covered_validator_epochs(&pool, &coverage_ranges)
+                    .await
+                    .unwrap_or(0) as u64;
             let missing = expected.saturating_sub(found);
             if missing > 0 {
                 tracing::warn!(
@@ -217,9 +226,8 @@ async fn main() -> anyhow::Result<()> {
                     expected_validator_epochs = expected,
                     found_validator_epochs = found,
                     missing_validator_epochs = missing,
-                    "Data gaps detected in attestation_duties. A previous \
-                     live-only run likely advanced watermarks past unscanned \
-                     validator epochs. Run with `--non-contiguous-backfill` to fill gaps."
+                    "Incomplete historical scans detected. Run with `--non-contiguous-backfill` \
+                     and an archive node to repair missing or unverified data."
                 );
             }
         }
@@ -241,68 +249,18 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        if let Some(earliest) = backfill::earliest_epoch_to_scan(&config, &validator_scan_state)
+        if matches!(config.mode, RunMode::Backfill)
+            && finalized_target.is_some()
+            && let Some(earliest) = backfill::earliest_epoch_to_scan(&config, &validator_scan_state)
             && earliest <= f0
         {
-            let strict =
-                matches!(config.mode, RunMode::Backfill) || config.backfill_beacon_url.is_some();
             match backfill::probe_archival_capability(&backfill_client, earliest).await {
-                Ok(true) => {
-                    tracing::debug!(
-                        earliest,
-                        "Backfill client can serve earliest required epoch"
-                    );
-                }
-                Ok(false) if strict => {
-                    anyhow::bail!(
-                        "backfill client cannot serve epoch {earliest} (state pruned). \
-                         {}",
-                        if config.backfill_beacon_url.is_some() {
-                            "Point `backfill_beacon_url` at an archive node, or remove the \
-                             setting to share the live client."
-                        } else {
-                            "Set `backfill_beacon_url` to an archive node, or run with \
-                             `--mode both` to keep live tracking active despite the gap."
-                        }
-                    );
-                }
-                Err(e) if strict => {
-                    anyhow::bail!(
-                        "failed to probe backfill client at epoch {earliest}: {e}. \
-                         Verify `backfill_beacon_url` is reachable."
-                    );
-                }
-                Ok(false) => {
-                    backfill_should_run = false;
-                    let has_existing_data =
-                        validator_scan_state.values().any(|(_, ls)| ls.is_some());
-                    if has_existing_data {
-                        tracing::warn!(
-                            earliest,
-                            f0,
-                            "Data gap cannot be refilled by the live (shared) beacon client \
-                             (historical states pruned). Skipping backfill — live tracking \
-                             continues. To refill, point `backfill_beacon_url` at an archive \
-                             node and run with `--non-contiguous-backfill`."
-                        );
-                    } else {
-                        tracing::warn!(
-                            earliest,
-                            "Skipping backfill: beacon node has pruned historical states. \
-                             Set `backfill_beacon_url` to an archive node for full history. \
-                             Live tracking will continue."
-                        );
-                    }
-                }
-                Err(e) => {
-                    backfill_should_run = false;
-                    tracing::warn!(
-                        error = %e,
-                        earliest,
-                        "Failed to probe live (shared) backfill client; skipping backfill, \
-                         live tracking continues"
-                    );
-                }
+                Ok(true) => {}
+                Ok(false) => anyhow::bail!(
+                    "backfill client cannot serve epoch {earliest} (state pruned). \
+                     Use an archive node, or --mode both to keep live tracking running."
+                ),
+                Err(e) => anyhow::bail!("failed to probe backfill client at epoch {earliest}: {e}"),
             }
         }
     }
@@ -317,9 +275,8 @@ async fn main() -> anyhow::Result<()> {
                 &pool,
                 instance_id,
                 &tracked_set,
-                effective_scan_mode,
                 live_updates_tx,
-                f0,
+                config.live.clone(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -329,22 +286,65 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let backfill_fut = async {
-        if backfill_should_run {
-            // `extend` only when there's no live worker to take over once
-            // backfill catches up to the initial target.
-            let extend = matches!(config.mode, RunMode::Backfill);
+        if matches!(config.mode, RunMode::Both) {
+            let mut historical_done = !backfill_should_run;
+            let tracked: Vec<i64> = tracked_set.iter().map(|v| *v as i64).collect();
+            loop {
+                // Repair recent persisted gaps even if much older history is unavailable.
+                match live_client.get_finality_checkpoints("head").await {
+                    Ok(checkpoint) => {
+                        if let Some(target) =
+                            chain::finalized_scan_target(checkpoint.finalized.epoch)
+                            && let Err(error) = backfill::repair_live_gaps(
+                                &backfill_client,
+                                &pool,
+                                &tracked,
+                                target,
+                                effective_scan_mode,
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error,"Live gap repair pending");
+                        }
+                    }
+                    Err(error) => tracing::debug!(%error,"Cannot refresh archive repair target"),
+                }
+                if !historical_done {
+                    match backfill::run_backfill(
+                        &backfill_client,
+                        &pool,
+                        &config,
+                        validator_scan_state.clone(),
+                        f0,
+                        instance_id,
+                        live_updates_tx_for_bf.clone(),
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(()) => historical_done = true,
+                        Err(error) => {
+                            tracing::warn!(%error,"Historical backfill unavailable; live collection continues")
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        } else if backfill_should_run {
             backfill::run_backfill(
                 &backfill_client,
                 &pool,
                 &config,
-                validator_scan_state,
+                validator_scan_state.clone(),
                 f0,
                 instance_id,
-                live_updates_tx_for_bf,
-                extend,
+                live_updates_tx_for_bf.clone(),
+                true,
             )
             .await
             .map_err(anyhow::Error::from)
+        } else if matches!(config.mode, RunMode::Backfill) {
+            Ok(())
         } else {
             futures::future::pending::<anyhow::Result<()>>().await
         }

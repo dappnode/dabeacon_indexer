@@ -1,12 +1,13 @@
 pub mod blocks;
 pub mod committees;
 pub mod duties;
+mod inputs;
+pub mod metadata;
 pub mod rewards;
 pub mod spec;
 pub mod types;
 pub mod validators;
 
-use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::beacon_client::types::{
-    AttesterDuty, BeaconResponse, BlockRoot, Committee, FinalityCheckpoints, ProposerDuty,
-    SignedBeaconBlock, SyncCommitteeData, SyncDuty,
+    BeaconResponse, BlockRoot, FinalityCheckpoints, SignedBeaconBlock,
 };
 use crate::error::{Error, Result};
 
@@ -26,39 +26,9 @@ const BEACON_RETRY_BASE_DELAY_MS: u64 = 200;
 const ROOT_BLOCK_CACHE_CAPACITY: usize = 128;
 const SLOT_ROOT_CACHE_CAPACITY: usize = 512;
 
-// Duty/committee caches. Values are stable within their epoch / TTL, so hits
-// are effectively free correctness-wise; these drive down live-mode beacon
-// pressure (per-slot head events + SSE refreshes hit the same keys).
-const COMMITTEES_CACHE_CAPACITY: usize = 8;
-const PROPOSER_DUTIES_CACHE_CAPACITY: usize = 16;
-const ATTESTER_DUTIES_CACHE_CAPACITY: usize = 32;
-const SYNC_DUTIES_CACHE_CAPACITY: usize = 32;
-// Sync-committee composition is stable for a full period (~27h on mainnet), so
-// a tiny LRU comfortably covers period transitions.
-const SYNC_COMMITTEE_CACHE_CAPACITY: usize = 4;
+const INPUT_CACHE_CAPACITY: usize = 128;
 const HEAD_SLOT_TTL: Duration = Duration::from_secs(2);
 const HEAD_FINALITY_TTL: Duration = Duration::from_secs(10);
-
-/// Cache key for validator-scoped duty queries. Two callers with the same
-/// epoch but different validator sets do not share a cache entry.
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
-pub(crate) struct DutiesKey {
-    pub(crate) epoch: u64,
-    pub(crate) validators_hash: u64,
-}
-
-impl DutiesKey {
-    pub(crate) fn new(epoch: u64, validator_indices: &[u64]) -> Self {
-        let mut sorted: Vec<u64> = validator_indices.to_vec();
-        sorted.sort_unstable();
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        sorted.hash(&mut h);
-        Self {
-            epoch,
-            validators_hash: h.finish(),
-        }
-    }
-}
 
 pub struct BeaconClient {
     client: Client,
@@ -75,14 +45,8 @@ pub struct BeaconClient {
     // don't serialise. Writes still take the exclusive lock.
     pub(crate) head_slot_cache: RwLock<Option<(u64, Instant)>>,
     pub(crate) head_finality_cache: RwLock<Option<(FinalityCheckpoints, Instant)>>,
-    pub(crate) committees_cache: RwLock<LruCache<u64, Vec<Committee>>>,
-    pub(crate) proposer_duties_cache: RwLock<LruCache<u64, Vec<ProposerDuty>>>,
-    pub(crate) attester_duties_cache: RwLock<LruCache<DutiesKey, Vec<AttesterDuty>>>,
-    pub(crate) sync_duties_cache: RwLock<LruCache<DutiesKey, Vec<SyncDuty>>>,
-    /// Keyed by sync-committee period (epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD).
-    /// Composition is stable for the whole period, so a single fetch per period
-    /// covers every epoch scan that touches it.
-    pub(crate) sync_committee_cache: RwLock<LruCache<u64, SyncCommitteeData>>,
+    input_cache: RwLock<LruCache<String, inputs::CachedInput>>,
+    input_pool: Option<sqlx::PgPool>,
 }
 
 impl BeaconClient {
@@ -115,11 +79,8 @@ impl BeaconClient {
             slot_root_cache: Mutex::new(LruCache::new(nz(SLOT_ROOT_CACHE_CAPACITY))),
             head_slot_cache: RwLock::new(None),
             head_finality_cache: RwLock::new(None),
-            committees_cache: RwLock::new(LruCache::new(nz(COMMITTEES_CACHE_CAPACITY))),
-            proposer_duties_cache: RwLock::new(LruCache::new(nz(PROPOSER_DUTIES_CACHE_CAPACITY))),
-            attester_duties_cache: RwLock::new(LruCache::new(nz(ATTESTER_DUTIES_CACHE_CAPACITY))),
-            sync_duties_cache: RwLock::new(LruCache::new(nz(SYNC_DUTIES_CACHE_CAPACITY))),
-            sync_committee_cache: RwLock::new(LruCache::new(nz(SYNC_COMMITTEE_CACHE_CAPACITY))),
+            input_cache: RwLock::new(LruCache::new(nz(INPUT_CACHE_CAPACITY))),
+            input_pool: None,
         }
     }
 
@@ -127,11 +88,7 @@ impl BeaconClient {
     /// reorg handler so a reorg crossing an epoch boundary can't serve
     /// pre-reorg duties out of cache.
     pub async fn invalidate_duty_caches(&self) {
-        self.committees_cache.write().await.clear();
-        self.proposer_duties_cache.write().await.clear();
-        self.attester_duties_cache.write().await.clear();
-        self.sync_duties_cache.write().await.clear();
-        self.sync_committee_cache.write().await.clear();
+        self.input_cache.write().await.clear();
         *self.head_slot_cache.write().await = None;
         *self.head_finality_cache.write().await = None;
     }
@@ -248,6 +205,7 @@ impl BeaconClient {
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let resp = self.get_response(path).await?;
         let beacon_resp: BeaconResponse<T> = resp.json().await.map_err(Error::Http)?;
+        beacon_resp.ensure_not_optimistic()?;
         Ok(beacon_resp.data)
     }
 
@@ -367,6 +325,7 @@ impl BeaconClient {
     ) -> Result<T> {
         let resp = self.post_response(path, body).await?;
         let beacon_resp: BeaconResponse<T> = resp.json().await.map_err(Error::Http)?;
+        beacon_resp.ensure_not_optimistic()?;
         Ok(beacon_resp.data)
     }
 }

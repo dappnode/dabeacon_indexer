@@ -5,7 +5,7 @@ use crate::error::Result;
 
 /// Upsert one sync-committee duty row. Like [`super::attestations::upsert_attestation_duty`],
 /// the `ON CONFLICT` guard prevents live writes from clobbering finalized rows,
-/// but allows finalized writes to backfill missing rewards on finalized rows.
+/// but allows finalized writes to repair rows from incomplete scans.
 pub async fn upsert_sync_duty(
     pool: &Pool,
     validator_index: i64,
@@ -22,11 +22,14 @@ pub async fn upsert_sync_duty(
         VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (validator_index, slot) DO UPDATE SET
             participated = EXCLUDED.participated,
-            reward = EXCLUDED.reward,
+            reward = COALESCE(EXCLUDED.reward, sync_duties.reward),
             missed_block = EXCLUDED.missed_block,
             finalized = EXCLUDED.finalized
         WHERE sync_duties.finalized = FALSE
-           OR (EXCLUDED.finalized = TRUE AND sync_duties.reward IS NULL)
+           OR (EXCLUDED.finalized = TRUE AND NOT EXISTS (
+               SELECT 1 FROM completed_scans c
+               WHERE c.validator_index = sync_duties.validator_index
+                 AND c.epoch = sync_duties.slot / $7))
         "#,
     )
     .bind(validator_index)
@@ -35,6 +38,7 @@ pub async fn upsert_sync_duty(
     .bind(reward)
     .bind(missed_block)
     .bind(finalized)
+    .bind(crate::chain::slots_per_epoch() as i64)
     .execute(pool)
     .await
     .inspect_err(|_| {

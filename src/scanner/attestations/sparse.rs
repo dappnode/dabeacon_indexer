@@ -3,22 +3,12 @@
 //! Designed for 1–5 tracked validators where the dense flow's 64-block fetch
 //! amortises poorly — most decoded attestations are for untracked validators.
 //!
-//! Correctness is derived directly from `/eth/v1/beacon/rewards/attestations`:
-//! Altair+ rewards are paid for timely-and-correct components, so a positive
-//! reward is the authoritative signal that the corresponding vote (source /
-//! target / head) was correct. Inclusion is detected by scanning forward from
-//! each duty's slot and short-circuiting on the first block that contains the
-//! validator's attestation. Duties whose rewards show no inclusion skip the
-//! block scan entirely.
-//!
-//! # Semantic difference from dense
-//!
-//! Dense mode's `*_correct` columns reflect "the vote was right". Sparse mode's
-//! columns reflect "the validator earned the reward for that component", which
-//! requires both a correct vote AND timely inclusion (next slot for head,
-//! within ~5 for source, within 32 for target). A correct head vote included
-//! one slot late therefore reads `head_correct = false` in sparse but `true`
-//! in dense. Operators typically care about the reward-qualifying definition.
+//! Every duty is scanned through its full inclusion window, including when all
+//! rewards are zero (for example during an inactivity leak). `included` records
+//! observed inclusion independently of rewards. The shared `*_correct` contract
+//! is vote correctness: a positive reward proves a correct vote, while zero or
+//! negative rewards leave correctness unknown without canonical vote context.
+//! Dense archive scans may refine unknown flags using that context.
 
 use std::collections::{HashMap, HashSet};
 
@@ -53,37 +43,18 @@ pub(super) fn derive_sparse_row(
     reward: Option<&ValidatorAttestationReward>,
     found_inclusion: Option<(u64, u32)>,
 ) -> SparseRow {
-    let Some(reward) = reward else {
-        return SparseRow {
-            included: false,
-            inclusion_slot: None,
-            inclusion_delay: None,
-            effective_inclusion_delay: None,
-            source_correct: None,
-            target_correct: None,
-            head_correct: None,
-            source_reward: None,
-            target_reward: None,
-            head_reward: None,
-            inactivity_penalty: None,
-        };
-    };
-
-    // A positive reward for any component implies both inclusion AND a correct
-    // vote for that component — see module docs for the semantic caveat.
-    let included = reward.source > 0 || reward.target > 0 || reward.head > 0;
+    let included = found_inclusion.is_some();
 
     let (inclusion_slot, inclusion_delay, effective_inclusion_delay) =
-        match (found_inclusion, reward.inclusion_delay) {
+        match (found_inclusion, reward.and_then(|r| r.inclusion_delay)) {
             (Some((slot, missed_before)), _) => {
                 let delay = (slot as i64 - duty.slot as i64) as i32;
                 let effective = delay.saturating_sub(missed_before as i32);
                 (Some(slot as i64), Some(delay), Some(effective))
             }
-            // Scan didn't locate the block (or wasn't run). Without the intervening
-            // missed-slot count we fall back to raw == effective: the row remains
-            // visible to effective-delay filters, and a later re-scan can refine it.
-            (None, Some(delay)) => (None, Some(delay as i32), Some(delay as i32)),
+            // A response delay without the including block does not provide the
+            // skipped-slot coverage needed for an effective delay.
+            (None, Some(delay)) => (None, Some(delay as i32), None),
             (None, None) => (None, None, None),
         };
 
@@ -92,13 +63,13 @@ pub(super) fn derive_sparse_row(
         inclusion_slot,
         inclusion_delay,
         effective_inclusion_delay,
-        source_correct: Some(reward.source > 0),
-        target_correct: Some(reward.target > 0),
-        head_correct: Some(reward.head > 0),
-        source_reward: Some(reward.source),
-        target_reward: Some(reward.target),
-        head_reward: Some(reward.head),
-        inactivity_penalty: reward.inactivity,
+        source_correct: reward.and_then(|r| (r.source > 0).then_some(true)),
+        target_correct: reward.and_then(|r| (r.target > 0).then_some(true)),
+        head_correct: reward.and_then(|r| (r.head > 0).then_some(true)),
+        source_reward: reward.map(|r| r.source),
+        target_reward: reward.map(|r| r.target),
+        head_reward: reward.map(|r| r.head),
+        inactivity_penalty: reward.and_then(|r| r.inactivity),
     }
 }
 
@@ -129,6 +100,7 @@ pub async fn process_epoch_attestation_duties_sparse(
         .into_iter()
         .map(|r| (r.validator_index, r))
         .collect();
+    super::validate_epoch_response(scan_validators, &duties, &rewards_map)?;
 
     // Phase 3: committees.
     let phase_t = Instant::now();
@@ -151,30 +123,20 @@ pub async fn process_epoch_attestation_duties_sparse(
 
         let reward = rewards_map.get(&duty.validator_index);
 
-        let rewards_say_included = reward
-            .map(|r| r.source > 0 || r.target > 0 || r.head > 0)
-            .unwrap_or(false);
-
-        // Skip the forward scan when rewards show no inclusion — no block fetch
-        // can find what isn't there.
+        // A zero reward is not evidence of a miss. Only a successful complete
+        // scan can establish absence; any failed block request aborts this duty.
         let scan_t = Instant::now();
-        let found_inclusion_slot = if rewards_say_included {
-            let scan =
-                scan_forward_for_inclusion(client, duty, epoch, &committee_map, &mut block_fetches)
-                    .await?;
-            if scan.is_none() {
-                tracing::warn!(
-                    epoch,
-                    validator = duty.validator_index,
-                    duty_slot = duty.slot,
-                    "Rewards show inclusion but scan-forward didn't find the including block — \
-                     inclusion_slot will be NULL"
-                );
-            }
-            scan
-        } else {
-            None
-        };
+        let found_inclusion_slot =
+            scan_forward_for_inclusion(client, duty, epoch, &committee_map, &mut block_fetches)
+                .await?;
+        if found_inclusion_slot.is_none()
+            && reward.is_some_and(|r| r.source > 0 || r.target > 0 || r.head > 0)
+        {
+            return Err(crate::error::Error::InconsistentBeaconData(format!(
+                "positive rewards but no inclusion for validator {} in epoch {epoch}",
+                duty.validator_index
+            )));
+        }
         scan_ms += scan_t.elapsed().as_millis() as u64;
 
         let row = derive_sparse_row(duty, reward, found_inclusion_slot);
@@ -257,7 +219,7 @@ async fn scan_forward_for_inclusion(
     block_fetches: &mut u32,
 ) -> Result<Option<(u64, u32)>> {
     // EIP-7045: inclusion must happen by target_epoch+1.
-    let last_slot = duty.slot + chain::slots_per_epoch();
+    let last_slot = chain::epoch_start_slot(target_epoch + 2) - 1;
     let probe_set: HashSet<u64> = std::iter::once(duty.validator_index).collect();
     let mut missed_before = 0u32;
 
@@ -335,15 +297,28 @@ mod tests {
     }
 
     #[test]
-    fn sparse_row_all_zero_rewards_is_missed() {
+    fn sparse_row_zero_rewards_without_observed_inclusion() {
         let r = reward(0, 0, 0, None, Some(-100));
         let row = derive_sparse_row(&duty(100), Some(&r), None);
         assert!(!row.included);
-        assert_eq!(row.source_correct, Some(false));
-        assert_eq!(row.target_correct, Some(false));
-        assert_eq!(row.head_correct, Some(false));
+        assert_eq!(row.source_correct, None);
+        assert_eq!(row.target_correct, None);
+        assert_eq!(row.head_correct, None);
         assert_eq!(row.inactivity_penalty, Some(-100));
         assert_eq!(row.inclusion_slot, None);
+    }
+
+    #[test]
+    fn observed_inclusion_survives_zero_or_missing_rewards() {
+        let zero = reward(0, 0, 0, None, Some(-100));
+        for rewards in [Some(&zero), None] {
+            let row = derive_sparse_row(&duty(100), rewards, Some((103, 1)));
+            assert!(row.included);
+            assert_eq!(row.inclusion_slot, Some(103));
+            assert_eq!(row.effective_inclusion_delay, Some(2));
+            assert_eq!(row.source_correct, None);
+            assert_eq!(row.head_correct, None);
+        }
     }
 
     #[test]
@@ -360,13 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn sparse_row_head_late_is_included_head_incorrect() {
+    fn sparse_row_head_late_leaves_vote_correctness_unknown() {
         let r = reward(10, 20, 0, None, None);
         let row = derive_sparse_row(&duty(100), Some(&r), Some((103, 0)));
         assert!(row.included);
         assert_eq!(row.source_correct, Some(true));
         assert_eq!(row.target_correct, Some(true));
-        assert_eq!(row.head_correct, Some(false));
+        assert_eq!(row.head_correct, None);
         assert_eq!(row.inclusion_slot, Some(103));
         assert_eq!(row.inclusion_delay, Some(3));
         assert_eq!(row.effective_inclusion_delay, Some(3));
@@ -382,19 +357,18 @@ mod tests {
 
     #[test]
     fn sparse_row_uses_reward_delay_when_scan_missed() {
-        // Pre-Altair path: reward carries the delay directly. Without a miss
-        // count we optimistically set effective = raw so the row stays visible
-        // to effective-delay filters.
+        // A legacy reward can carry a raw delay, but without the including
+        // block it cannot prove inclusion or the skipped-slot adjustment.
         let r = reward(10, 0, 0, Some(2), None);
         let row = derive_sparse_row(&duty(100), Some(&r), None);
-        assert!(row.included);
+        assert!(!row.included);
         assert_eq!(row.inclusion_slot, None);
         assert_eq!(row.inclusion_delay, Some(2));
-        assert_eq!(row.effective_inclusion_delay, Some(2));
+        assert_eq!(row.effective_inclusion_delay, None);
     }
 
     #[test]
-    fn sparse_row_no_reward_entry_is_defensively_missed() {
+    fn sparse_row_no_reward_entry_leaves_reward_and_correctness_unknown() {
         let row = derive_sparse_row(&duty(100), None, None);
         assert!(!row.included);
         assert_eq!(row.source_correct, None);

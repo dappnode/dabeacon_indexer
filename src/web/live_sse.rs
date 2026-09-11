@@ -130,20 +130,6 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
     let start_slot = epoch_start_slot(start_epoch);
     let end_slot = epoch_start_slot(current_epoch) + chain::slots_per_epoch();
 
-    let finalized_epoch = beacon_client
-        .get_finality_checkpoints("head")
-        .await
-        .context("failed to fetch finality checkpoints")?
-        .finalized
-        .epoch;
-
-    // Backfill lag (1 epoch grace): affects whether "no row yet" should be
-    // treated as "missed" or "unknown".
-    let is_backfilling = db_live::min_tracked_scanned_epoch(pool, &tracked_i64)
-        .await?
-        .map(|m| m.saturating_add(1) < finalized_epoch)
-        .unwrap_or(true);
-
     // Schedule (who was assigned what). DB only records outcomes — upcoming
     // slots have none yet, so we still need the beacon node for this.
     let schedule = fetch_schedule(
@@ -161,12 +147,8 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
     let sync_status = db_live::fetch_sync_status(pool, &tracked_i64, start_slot, end_slot).await?;
     let proposal_status = db_live::fetch_proposal_status(pool, start_slot, end_slot).await?;
 
-    let mut block_present: HashMap<u64, bool> = HashMap::new();
-    let last_decidable_slot = end_slot.min(head_slot + 1);
-    for slot in start_slot..last_decidable_slot {
-        let (root_opt, _) = beacon_client.get_block_root(slot).await?;
-        block_present.insert(slot, root_opt.is_some());
-    }
+    let block_present =
+        db_live::fetch_block_presence(pool, &tracked_i64, start_slot, end_slot).await?;
 
     // Sync committee membership hoisted to top level. Sync committees are
     // stable within a 256-epoch period, so effectively this list is constant
@@ -207,9 +189,6 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
                 validator_index: d.validator_index,
                 included: resolve_included(
                     attestation_status.get(&(slot, d.validator_index)).copied(),
-                    slot,
-                    head_slot,
-                    is_backfilling,
                 ),
             })
             .collect();
@@ -221,10 +200,7 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
                 if !member_epochs[&vi].contains(&slot_epoch) {
                     return None;
                 }
-                sync_status
-                    .get(&(slot, vi))
-                    .map(|&(p, _)| p)
-                    .or_else(|| fallback_missed_if_past(slot, head_slot, is_backfilling))
+                sync_status.get(&(slot, vi)).map(|&(p, _)| p)
             })
             .collect();
 
@@ -235,10 +211,7 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
             .map(|d| {
                 (
                     Some(d.validator_index),
-                    proposal_status
-                        .get(&slot)
-                        .map(|&(_, p)| p)
-                        .or_else(|| fallback_missed_if_past(slot, head_slot, is_backfilling)),
+                    proposal_status.get(&slot).map(|&(_, p)| p),
                 )
             })
             .unwrap_or((None, None));
@@ -319,26 +292,22 @@ async fn fetch_schedule(
     })
 }
 
-/// Finalized rows are authoritative; otherwise we only call "missed" once the
-/// inclusion window (chain::slots_per_epoch()) has passed AND backfill is caught up.
-fn resolve_included(
-    stored: Option<(bool, bool)>,
-    assigned_slot: u64,
-    head_slot: u64,
-    is_backfilling: bool,
-) -> Option<bool> {
-    let window_closed =
-        !is_backfilling && head_slot >= assigned_slot.saturating_add(chain::slots_per_epoch());
+/// Passing time cannot prove coverage: only stored evidence establishes a miss.
+fn resolve_included(stored: Option<(bool, bool)>) -> Option<bool> {
     match stored {
         Some((true, _)) => Some(true),
-        Some((false, finalized)) if finalized || window_closed => Some(false),
-        Some((false, _)) => None,
-        None if window_closed => Some(false),
-        None => None,
+        Some((false, true)) => Some(false),
+        Some((false, false)) | None => None,
     }
 }
 
-/// "Slot is already past head and backfill is caught up — call missing rows missed".
-fn fallback_missed_if_past(slot: u64, head_slot: u64, is_backfilling: bool) -> Option<bool> {
-    (!is_backfilling && slot < head_slot).then_some(false)
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_proven_coverage_establishes_a_miss() {
+        assert_eq!(super::resolve_included(None), None);
+        assert_eq!(super::resolve_included(Some((false, false))), None);
+        assert_eq!(super::resolve_included(Some((false, true))), Some(false));
+        assert_eq!(super::resolve_included(Some((true, false))), Some(true));
+    }
 }

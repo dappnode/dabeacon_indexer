@@ -3,8 +3,12 @@
 //! which holds the read-side queries behind the web endpoints.
 
 pub mod attestations;
-pub mod finalization;
+pub mod completion;
 pub mod instance;
+pub mod live;
 pub mod proposals;
 pub mod sync;
 pub mod validators;
+
+#[cfg(test)]
+mod tests;

@@ -1,79 +1,73 @@
-//! Duty-endpoint wrappers. Cached per-epoch, or per `(epoch, validator-set-hash)`
-//! for validator-scoped endpoints. A reorg crossing an epoch boundary
-//! invalidates via `invalidate_duty_caches`.
-
-use crate::beacon_client::types::{AttesterDuty, ProposerDuty, SyncDuty};
+//! Assignment responses retain dependent roots and use canonically anchored
+//! durable inputs rather than trusting an epoch-only in-memory cache.
+use super::BeaconClient;
+use crate::beacon_client::types::{AttesterDuty, BeaconResponse, ProposerDuty, SyncDuty};
 use crate::error::Result;
 
-use super::{BeaconClient, DutiesKey};
-
 impl BeaconClient {
+    pub async fn get_attester_duties_response(
+        &self,
+        epoch: u64,
+        indices: &[u64],
+    ) -> Result<BeaconResponse<Vec<AttesterDuty>>> {
+        let body: Vec<String> = indices.iter().map(u64::to_string).collect();
+        self.cached_input(
+            epoch,
+            &format!("/eth/v1/validator/duties/attester/{epoch}"),
+            Some(&body),
+        )
+        .await
+    }
     pub async fn get_attester_duties(
         &self,
         epoch: u64,
-        validator_indices: &[u64],
+        indices: &[u64],
     ) -> Result<Vec<AttesterDuty>> {
-        let key = DutiesKey::new(epoch, validator_indices);
-        if let Some(hit) = self.attester_duties_cache.read().await.peek(&key).cloned() {
-            crate::metrics::record_cache("attester_duties", true);
-            tracing::trace!(epoch, "attester_duties cache hit");
-            return Ok(hit);
-        }
-        crate::metrics::record_cache("attester_duties", false);
-        let body: Vec<String> = validator_indices.iter().map(|i| i.to_string()).collect();
-        let fetched: Vec<AttesterDuty> = self
-            .post(&format!("/eth/v1/validator/duties/attester/{epoch}"), &body)
-            .await?;
-        self.attester_duties_cache
-            .write()
-            .await
-            .put(key, fetched.clone());
-        Ok(fetched)
+        Ok(self
+            .get_attester_duties_response(epoch, indices)
+            .await?
+            .data)
     }
-
-    pub async fn get_proposer_duties(&self, epoch: u64) -> Result<Vec<ProposerDuty>> {
-        if let Some(hit) = self
-            .proposer_duties_cache
-            .read()
-            .await
-            .peek(&epoch)
-            .cloned()
-        {
-            crate::metrics::record_cache("proposer_duties", true);
-            tracing::trace!(epoch, "proposer_duties cache hit");
-            return Ok(hit);
-        }
-        crate::metrics::record_cache("proposer_duties", false);
-        let fetched: Vec<ProposerDuty> = self
-            .get(&format!("/eth/v1/validator/duties/proposer/{epoch}"))
-            .await?;
-        self.proposer_duties_cache
-            .write()
-            .await
-            .put(epoch, fetched.clone());
-        Ok(fetched)
-    }
-
-    pub async fn get_sync_duties(
+    pub async fn get_proposer_duties_response(
         &self,
         epoch: u64,
-        validator_indices: &[u64],
-    ) -> Result<Vec<SyncDuty>> {
-        let key = DutiesKey::new(epoch, validator_indices);
-        if let Some(hit) = self.sync_duties_cache.read().await.peek(&key).cloned() {
-            crate::metrics::record_cache("sync_duties", true);
-            tracing::trace!(epoch, "sync_duties cache hit");
-            return Ok(hit);
+    ) -> Result<BeaconResponse<Vec<ProposerDuty>>> {
+        self.cached_input(
+            epoch,
+            &format!("/eth/v1/validator/duties/proposer/{epoch}"),
+            None,
+        )
+        .await
+    }
+    pub async fn get_proposer_duties(&self, epoch: u64) -> Result<Vec<ProposerDuty>> {
+        let duties = self.get_proposer_duties_response(epoch).await?.data;
+        let start = crate::chain::epoch_start_slot(epoch);
+        let end = crate::chain::epoch_start_slot(epoch + 1);
+        let slots: std::collections::HashSet<u64> = duties.iter().map(|d| d.slot).collect();
+        if duties.len() != crate::chain::slots_per_epoch() as usize
+            || slots.len() != duties.len()
+            || slots.iter().any(|slot| *slot < start || *slot >= end)
+        {
+            return Err(crate::error::Error::InconsistentBeaconData(
+                "proposer response does not cover every slot in the requested epoch".into(),
+            ));
         }
-        crate::metrics::record_cache("sync_duties", false);
-        let body: Vec<String> = validator_indices.iter().map(|i| i.to_string()).collect();
-        let fetched: Vec<SyncDuty> = self
-            .post(&format!("/eth/v1/validator/duties/sync/{epoch}"), &body)
-            .await?;
-        self.sync_duties_cache
-            .write()
-            .await
-            .put(key, fetched.clone());
-        Ok(fetched)
+        Ok(duties)
+    }
+    pub async fn get_sync_duties_response(
+        &self,
+        epoch: u64,
+        indices: &[u64],
+    ) -> Result<BeaconResponse<Vec<SyncDuty>>> {
+        let body: Vec<String> = indices.iter().map(u64::to_string).collect();
+        self.cached_input(
+            epoch,
+            &format!("/eth/v1/validator/duties/sync/{epoch}"),
+            Some(&body),
+        )
+        .await
+    }
+    pub async fn get_sync_duties(&self, epoch: u64, indices: &[u64]) -> Result<Vec<SyncDuty>> {
+        Ok(self.get_sync_duties_response(epoch, indices).await?.data)
     }
 }

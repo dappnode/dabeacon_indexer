@@ -49,9 +49,9 @@ pub async fn list_validator_summaries(pool: &Pool) -> Result<Vec<ValidatorSummar
         FROM validators v
         LEFT JOIN LATERAL (
             SELECT
-                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE included OR inclusion_known) as total,
                 COUNT(*) FILTER (WHERE included) as included,
-                COUNT(*) FILTER (WHERE NOT included) as missed,
+                COUNT(*) FILTER (WHERE NOT included AND inclusion_known) as missed,
                 COUNT(*) FILTER (WHERE included AND source_correct IS NOT NULL) as decided,
                 COUNT(*) FILTER (WHERE head_correct) as head_ok,
                 COUNT(*) FILTER (WHERE target_correct) as target_ok,

@@ -21,6 +21,39 @@ use crate::error::{Error, Result};
 use crate::live_updates::LiveUpdateEvent;
 use crate::scanner;
 
+/// Repair persisted live gaps after startup as well as historical catch-up.
+/// Recent gaps get a small independent budget so unavailable old history does
+/// not prevent repair of data an ordinary node can still serve.
+pub async fn repair_live_gaps(
+    client: &BeaconClient,
+    pool: &PgPool,
+    tracked: &[i64],
+    target: u64,
+    mode: crate::config::EffectiveScanMode,
+) -> Result<()> {
+    let gaps: Vec<(i64, Vec<i64>)> = sqlx::query_as(
+        "SELECT epoch,ARRAY_AGG(validator_index ORDER BY validator_index)
+        FROM (SELECT g.epoch,g.validator_index FROM live_gaps g
+              WHERE g.validator_index=ANY($1) AND g.epoch<=$2
+              AND NOT EXISTS (SELECT 1 FROM completed_scans c
+                  WHERE c.validator_index=g.validator_index AND c.epoch=g.epoch)) gaps
+        GROUP BY epoch ORDER BY epoch DESC LIMIT 8",
+    )
+    .bind(tracked)
+    .bind(target as i64)
+    .fetch_all(pool)
+    .await?;
+    for (epoch, validators) in gaps {
+        let validators = validators.into_iter().map(|v| v as u64).collect();
+        if let Err(error) =
+            scanner::scan_epoch(client, pool, epoch as u64, &validators, true, mode).await
+        {
+            tracing::debug!(epoch,%error,"Archive repair remains pending");
+        }
+    }
+    Ok(())
+}
+
 /// Earliest epoch the backfill task will try to scan given the current
 /// validator watermarks and config. Returns `None` if the scan state is
 /// empty (nothing tracked).
@@ -176,28 +209,18 @@ pub async fn run_backfill(
                 continue;
             }
 
-            let scan_validators: HashSet<u64> = if this_pass_non_contiguous {
-                let candidate_ids: Vec<i64> = candidates.iter().map(|&v| v as i64).collect();
-                let covered = db::scanner::attestations::validators_with_finalized_attestation(
-                    pool,
-                    &candidate_ids,
-                    epoch as i64,
-                )
-                .await?;
-                let needs: HashSet<u64> = candidates
-                    .into_iter()
-                    .filter(|idx| !covered.contains(&(*idx as i64)))
-                    .collect();
-                tracing::debug!(
-                    epoch,
-                    covered = covered.len(),
-                    to_scan = needs.len(),
-                    "Non-contiguous gap check"
-                );
-                needs
-            } else {
-                candidates
-            };
+            // Also skip completed epochs on retry, even in contiguous mode.
+            let candidate_ids: Vec<i64> = candidates.iter().map(|&v| v as i64).collect();
+            let covered = db::scanner::attestations::validators_with_completed_scan(
+                pool,
+                &candidate_ids,
+                epoch as i64,
+            )
+            .await?;
+            let scan_validators: HashSet<u64> = candidates
+                .into_iter()
+                .filter(|idx| !covered.contains(&(*idx as i64)))
+                .collect();
 
             if scan_validators.is_empty() {
                 epochs_skipped_covered += 1;
@@ -306,11 +329,14 @@ pub async fn run_backfill(
         if !extend_on_finality_advance {
             break;
         }
-        let new_target = client
+        let checkpoint = client
             .get_finality_checkpoints("head")
             .await?
             .finalized
             .epoch;
+        let Some(new_target) = chain::finalized_scan_target(checkpoint) else {
+            break;
+        };
         if new_target <= target_finalized_epoch {
             tracing::info!(
                 last_backfilled_epoch = target_finalized_epoch,

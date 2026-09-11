@@ -11,8 +11,8 @@ use futures::future::join_all;
 /// Probe the beacon node once for the epoch's sync `participant_reward`
 /// magnitude. Walks `slot_blocks` until it finds a block-present slot
 /// whose parent state is available, asks the rewards endpoint for that
-/// slot with our tracked committee members, and returns the first
-/// non-zero `|reward|`.
+/// slot with our tracked committee members, and divides a validator total
+/// by its net participating positions to recover the per-position reward.
 ///
 /// The participant reward is a function of `total_active_balance`,
 /// `SLOTS_PER_EPOCH`, and `SYNC_COMMITTEE_SIZE` only — it's uniform
@@ -26,11 +26,14 @@ async fn probe_sync_participant_reward(
     client: &BeaconClient,
     slot_blocks: &[(u64, Option<SignedBeaconBlock>)],
     relevant: &[u64],
+    committee: &[u64],
 ) -> Result<Option<i64>> {
     for (slot, block) in slot_blocks {
-        if block.is_none() {
+        let Some(aggregate) = block.as_ref().and_then(|b| b.sync_aggregate()) else {
             continue;
-        }
+        };
+        let bits = decode_sync_committee_bits(&aggregate.sync_committee_bits)?;
+        let outcomes = sync_outcomes(committee, &bits);
         let rewards = match client.get_sync_committee_rewards(*slot, relevant).await {
             Ok(r) => r,
             Err(Error::BeaconApi { status: 404, .. }) => {
@@ -42,18 +45,41 @@ async fn probe_sync_participant_reward(
             }
             Err(e) => return Err(e),
         };
-        if let Some(magnitude) = rewards.iter().map(|r| r.reward.abs()).find(|&m| m > 0) {
-            tracing::debug!(slot = *slot, magnitude, "Probed sync participant_reward");
-            return Ok(Some(magnitude));
+        for reward in rewards {
+            let Some(&(_, net_positions)) = outcomes.get(&reward.validator_index) else {
+                continue;
+            };
+            if let Some(magnitude) = per_position_reward(reward.reward, net_positions)? {
+                return Ok(Some(magnitude));
+            }
         }
-        // Block present but all rewards are 0 — unusual but not fatal on a
-        // non-archival node where the response may be incomplete. Try next.
-        tracing::debug!(
-            slot,
-            "Sync rewards probe: all rewards zero, trying next slot"
-        );
     }
     Ok(None)
+}
+
+/// Zero net positions cancel and cannot reveal the per-position amount.
+fn per_position_reward(total: i64, net_positions: i64) -> Result<Option<i64>> {
+    if net_positions == 0 {
+        return Ok(None);
+    }
+    if total % net_positions != 0 || total / net_positions < 0 {
+        return Err(Error::InconsistentBeaconData(
+            "sync reward disagrees with participation".into(),
+        ));
+    }
+    Ok(Some(total / net_positions))
+}
+
+/// One outcome per validator; a validator can occupy multiple positions.
+/// Participation follows the live view (any signature); rewards sum every bit.
+fn sync_outcomes(committee: &[u64], bits: &[bool]) -> HashMap<u64, (bool, i64)> {
+    let mut outcomes = HashMap::new();
+    for (&validator, &bit) in committee.iter().zip(bits) {
+        let entry = outcomes.entry(validator).or_insert((false, 0));
+        entry.0 |= bit;
+        entry.1 += if bit { 1 } else { -1 };
+    }
+    outcomes
 }
 
 /// Decode `sync_committee_bits` from hex into a fixed-size bitvector.
@@ -142,7 +168,10 @@ pub async fn process_epoch_sync(
         slot_blocks.push((slot, block_res?));
     }
 
-    let magnitude = probe_sync_participant_reward(client, &slot_blocks, &relevant).await?;
+    let has_blocks = slot_blocks.iter().any(|(_, b)| b.is_some());
+    let magnitude =
+        probe_sync_participant_reward(client, &slot_blocks, &relevant, &sync_committee_validators)
+            .await?;
 
     for (slot, block_opt) in slot_blocks {
         match block_opt {
@@ -161,17 +190,18 @@ pub async fn process_epoch_sync(
                         "Sync aggregate in block"
                     );
 
-                    for (pos, &validator_index) in sync_committee_validators.iter().enumerate() {
+                    for (validator_index, (participated, net_positions)) in
+                        sync_outcomes(&sync_committee_validators, &bits)
+                    {
                         if !relevant_set.contains(&validator_index) {
                             continue;
                         }
-                        let participated = bits[pos];
-                        let reward = magnitude.map(|m| if participated { m } else { -m });
+                        let reward = magnitude.map(|m| m * net_positions);
 
                         tracing::trace!(
                             slot,
                             validator = validator_index,
-                            position = pos,
+                            net_positions,
                             participated,
                             reward,
                             "Sync committee participation"
@@ -222,6 +252,14 @@ pub async fn process_epoch_sync(
         }
     }
 
+    if magnitude.is_none() && has_blocks {
+        return Err(Error::BeaconApi {
+            status: 404,
+            message: format!(
+                "sync rewards unavailable for epoch {epoch}; participation saved, scan incomplete"
+            ),
+        });
+    }
     tracing::debug!("Sync committee processing complete");
     Ok(())
 }
@@ -234,7 +272,7 @@ pub async fn process_epoch_sync(
 /// - Block present without sync_aggregate (pre-Altair): no-op.
 /// - Missed slot (block=None): participated=false, missed_block=true.
 ///
-/// Rewards are left NULL; finalization rescan fills them in.
+/// Rewards are joined independently by the recent-block reward worker.
 pub async fn upsert_live_sync_in_slot(
     pool: &PgPool,
     slot: u64,
@@ -281,7 +319,7 @@ pub async fn upsert_live_sync_in_slot(
                     validator_index as i64,
                     slot as i64,
                     false,
-                    None,
+                    Some(0),
                     true,
                     false,
                 )
@@ -292,9 +330,76 @@ pub async fn upsert_live_sync_in_slot(
     Ok(())
 }
 
+/// Fetch validator totals independently of proposal/attestation reward requests.
+/// These totals already include every position occupied by repeated members.
+pub async fn fetch_live_sync_rewards(
+    client: &BeaconClient,
+    root: &crate::beacon_client::types::BlockRoot,
+    members: &[u64],
+) -> Result<
+    crate::beacon_client::types::BeaconResponse<
+        Vec<crate::beacon_client::types::SyncCommitteeReward>,
+    >,
+> {
+    if members.is_empty() {
+        return Err(Error::InconsistentBeaconData(
+            "refusing an unfiltered live sync reward request".into(),
+        ));
+    }
+    let response = client
+        .get_sync_committee_rewards_by_root(root, members)
+        .await?;
+    super::validate_reward_indices(
+        &members.iter().copied().collect(),
+        response.data.iter().map(|r| r.validator_index),
+    )?;
+    Ok(response)
+}
+
+/// Join validated totals to participation already decoded from the same root.
+/// The live worker stages the response so a missing participation row can be
+/// joined later without refetching the block's historical pre-state.
+pub async fn persist_live_sync_rewards(
+    pool: &PgPool,
+    slot: u64,
+    rewards: &[crate::beacon_client::types::SyncCommitteeReward],
+) -> Result<()> {
+    let indices: Vec<i64> = rewards.iter().map(|r| r.validator_index as i64).collect();
+    let values: Vec<i64> = rewards.iter().map(|r| r.reward).collect();
+    sqlx::query(
+        "UPDATE sync_duties AS duty SET reward = reward_data.reward \
+         FROM UNNEST($1::BIGINT[], $2::BIGINT[]) AS reward_data(validator_index, reward) \
+         WHERE duty.validator_index = reward_data.validator_index AND duty.slot = $3 \
+         AND duty.finalized = FALSE",
+    )
+    .bind(indices)
+    .bind(values)
+    .bind(slot as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_normalizes_validator_totals_before_reusing_the_reward() {
+        assert_eq!(per_position_reward(20, 2).unwrap(), Some(10));
+        assert_eq!(per_position_reward(-20, -2).unwrap(), Some(10));
+        assert_eq!(per_position_reward(0, 0).unwrap(), None);
+        assert!(per_position_reward(21, 2).is_err());
+        assert!(per_position_reward(-20, 2).is_err());
+    }
+
+    #[test]
+    fn repeated_members_sum_rewards_and_preserve_any_participation() {
+        let outcomes = sync_outcomes(&[1, 2, 1, 3, 2], &[true, false, true, false, true]);
+        assert_eq!(outcomes[&1], (true, 2));
+        assert_eq!(outcomes[&2], (true, 0));
+        assert_eq!(outcomes[&3], (false, -1));
+    }
 
     #[test]
     fn sync_committee_bits_lsb_first() {

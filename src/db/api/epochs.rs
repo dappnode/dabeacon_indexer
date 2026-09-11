@@ -87,9 +87,9 @@ pub async fn list_epoch_summaries_paginated(
         FROM (
             SELECT
                 a.epoch,
-                COUNT(*) as total_duties,
+                COUNT(*) FILTER (WHERE a.included OR a.inclusion_known) as total_duties,
                 COUNT(*) FILTER (WHERE a.included) as included,
-                COUNT(*) FILTER (WHERE NOT a.included) as missed,
+                COUNT(*) FILTER (WHERE NOT a.included AND a.inclusion_known) as missed,
                 COUNT(*) FILTER (WHERE a.head_correct AND a.included) as head_correct,
                 COUNT(*) FILTER (WHERE a.target_correct AND a.included) as target_correct,
                 COUNT(*) FILTER (WHERE a.source_correct AND a.included) as source_correct,

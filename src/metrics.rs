@@ -431,11 +431,58 @@ pub static LIVE_EPOCHS_INCOMPLETE: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter_with_registry!(
         Opts::new(
             "live_epochs_incomplete_total",
-            "Epochs finalized without reward data (state was pruned and epoch-transition fetch was missed)."
+            "Validator reward components retired from recent retries for archive repair."
         ),
         REGISTRY
     )
     .expect("register live_epochs_incomplete_total")
+});
+
+pub static LIVE_PENDING_JOBS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec_with_registry!(
+        Opts::new(
+            "live_pending_jobs",
+            "Unresolved validator reward components."
+        ),
+        &["status"],
+        REGISTRY
+    )
+    .expect("register live_pending_jobs")
+});
+
+pub static LIVE_OLDEST_GAP: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec_with_registry!(
+        Opts::new(
+            "live_oldest_gap_epoch",
+            "Oldest unresolved reward epoch, or -1 when none."
+        ),
+        &["status"],
+        REGISTRY
+    )
+    .expect("register live_oldest_gap_epoch")
+});
+
+pub static LIVE_GAPS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge_with_registry!(
+        Opts::new(
+            "live_gap_validator_epochs",
+            "Finalized validator epochs awaiting archive repair."
+        ),
+        REGISTRY
+    )
+    .expect("register live_gap_validator_epochs")
+});
+
+pub static LIVE_LAST_REWARD_SUCCESS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec_with_registry!(
+        Opts::new(
+            "live_last_reward_success_epoch",
+            "Most recent successfully staged reward epoch by component."
+        ),
+        &["component"],
+        REGISTRY
+    )
+    .expect("register live_last_reward_success_epoch")
 });
 
 // ---------------------------------------------------------------------------

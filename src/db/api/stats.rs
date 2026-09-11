@@ -32,9 +32,9 @@ pub async fn fetch_stats(pool: &Pool) -> Result<DbStats> {
     let att = sqlx::query(
         r#"
         SELECT
-            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE included OR inclusion_known) as total,
             COUNT(*) FILTER (WHERE included = TRUE) as included,
-            COUNT(*) FILTER (WHERE included = FALSE) as missed,
+            COUNT(*) FILTER (WHERE included = FALSE AND inclusion_known) as missed,
             COUNT(*) FILTER (WHERE included = TRUE AND source_correct IS NOT NULL) as decided,
             COUNT(*) FILTER (WHERE head_correct = TRUE) as head_ok,
             COUNT(*) FILTER (WHERE target_correct = TRUE) as target_ok,

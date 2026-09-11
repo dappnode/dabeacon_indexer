@@ -80,7 +80,7 @@ pub struct AttestationDutyRow {
     pub assigned_slot: i64,
     pub committee_index: i32,
     pub committee_position: i32,
-    pub included: bool,
+    pub included: Option<bool>,
     pub inclusion_slot: Option<i64>,
     pub inclusion_delay: Option<i32>,
     pub effective_inclusion_delay: Option<i32>,
@@ -178,7 +178,10 @@ pub async fn list_attestation_duties_paginated(
                 assigned_slot: r.get("assigned_slot"),
                 committee_index: r.get("committee_index"),
                 committee_position: r.get("committee_position"),
-                included: r.get("included"),
+                included: {
+                    let included: bool = r.get("included");
+                    (included || r.get::<bool, _>("inclusion_known")).then_some(included)
+                },
                 inclusion_slot: r.get("inclusion_slot"),
                 inclusion_delay: r.get("inclusion_delay"),
                 effective_inclusion_delay: r.get("effective_inclusion_delay"),
@@ -218,6 +221,9 @@ fn build_where(f: &AttestationFilter) -> String {
     }
     if f.included.is_some() {
         conds.push(format!("included = ${}", next()));
+        if f.included == Some(false) {
+            conds.push("inclusion_known = TRUE".to_string());
+        }
     }
     if f.head_correct.is_some() {
         conds.push(format!("head_correct = ${}", next()));

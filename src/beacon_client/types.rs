@@ -4,17 +4,32 @@ use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BeaconResponse<T> {
     pub data: T,
     #[serde(default)]
     pub execution_optimistic: Option<bool>,
     #[serde(default)]
     pub finalized: Option<bool>,
+    #[serde(default)]
+    pub dependent_root: Option<BlockRoot>,
+}
+
+impl<T> BeaconResponse<T> {
+    /// Missing metadata is unknown. Callers must independently verify ancestry;
+    /// an explicit optimistic response is never authoritative.
+    pub fn ensure_not_optimistic(&self) -> Result<()> {
+        if self.execution_optimistic == Some(true) {
+            return Err(Error::InconsistentBeaconData(
+                "execution-optimistic response".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +41,8 @@ pub enum BlockId {
     Finalized,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct Root(String);
 
 pub type BlockRoot = Root;
@@ -746,135 +762,245 @@ pub struct RawBlockRootResponse {
     pub data: BlockRootResponse,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Committee {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
     pub validators: Vec<StringU64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SyncCommitteeData {
     pub validators: Vec<StringU64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AttesterDuty {
     pub pubkey: String,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub committee_index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub committee_length: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub committees_at_slot: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_committee_index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProposerDuty {
     pub pubkey: String,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SyncDuty {
     pub pubkey: String,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_index: u64,
     #[serde(default)]
     pub validator_sync_committee_indices: Vec<StringU64>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 #[serde(transparent)]
-pub struct StringU64(#[serde(deserialize_with = "deser_u64_string")] pub u64);
+pub struct StringU64(
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
+    pub u64,
+);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AttestationRewardsResponse {
     pub ideal_rewards: Vec<IdealReward>,
     pub total_rewards: Vec<ValidatorAttestationReward>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct IdealReward {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub effective_balance: u64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub head: i64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub target: i64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub source: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ValidatorAttestationReward {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_index: u64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub head: i64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub target: i64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub source: i64,
-    #[serde(default, deserialize_with = "deser_i64_string_opt")]
+    #[serde(
+        default,
+        deserialize_with = "deser_i64_string_opt",
+        serialize_with = "ser_i64_string_opt"
+    )]
     pub inclusion_delay: Option<i64>,
-    #[serde(default, deserialize_with = "deser_i64_string_opt")]
+    #[serde(
+        default,
+        deserialize_with = "deser_i64_string_opt",
+        serialize_with = "ser_i64_string_opt"
+    )]
     pub inactivity: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SyncCommitteeReward {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub validator_index: u64,
-    #[serde(deserialize_with = "deser_i64_string")]
+    #[serde(
+        deserialize_with = "deser_i64_string",
+        serialize_with = "ser_i64_string"
+    )]
     pub reward: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BlockRewards {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub proposer_index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub total: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub attestations: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub sync_aggregate: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub proposer_slashings: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub attester_slashings: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ValidatorData {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub index: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub balance: u64,
     pub status: String,
     pub validator: ValidatorDetails,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ValidatorDetails {
     pub pubkey: String,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub effective_balance: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub activation_epoch: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub exit_epoch: u64,
 }
 
@@ -885,25 +1011,31 @@ pub struct FinalityCheckpoints {
     pub finalized: Checkpoint,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BeaconHeaderData {
     pub root: BlockRoot,
     pub canonical: bool,
     pub header: SignedBeaconHeader,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SignedBeaconHeader {
     pub message: BeaconHeaderMessage,
     #[serde(default)]
     pub signature: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BeaconHeaderMessage {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub proposer_index: u64,
     pub parent_root: BlockRoot,
     pub state_root: StateRoot,
@@ -934,29 +1066,60 @@ fn deser_i64_string_opt<'de, D: serde::Deserializer<'de>>(
 
 // Payloads of the `/eth/v1/events?topics=...` stream.
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HeadEvent {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
     pub block: BlockRoot,
     pub epoch_transition: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FinalizedCheckpointEvent {
     pub block: BlockRoot,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub epoch: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChainReorgEvent {
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub slot: u64,
-    #[serde(deserialize_with = "deser_u64_string")]
+    #[serde(
+        deserialize_with = "deser_u64_string",
+        serialize_with = "ser_u64_string"
+    )]
     pub depth: u64,
     pub old_head_block: BlockRoot,
     pub new_head_block: BlockRoot,
+}
+
+fn ser_u64_string<S: serde::Serializer>(
+    value: &u64,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
+}
+fn ser_i64_string<S: serde::Serializer>(
+    value: &i64,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
+}
+fn ser_i64_string_opt<S: serde::Serializer>(
+    value: &Option<i64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value.map(|v| v.to_string()).serialize(serializer)
 }
 
 #[cfg(test)]

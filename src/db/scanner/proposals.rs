@@ -5,7 +5,7 @@ use crate::error::Result;
 
 /// Upsert one block-proposal row. Like [`super::attestations::upsert_attestation_duty`],
 /// the `ON CONFLICT` guard prevents live writes from clobbering finalized rows,
-/// but allows finalized writes to backfill missing rewards on finalized rows.
+/// but allows finalized writes to repair rows from incomplete scans.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_block_proposal(
     pool: &Pool,
@@ -27,14 +27,18 @@ pub async fn upsert_block_proposal(
             finalized
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT (slot) DO UPDATE SET
+            proposer_index = EXCLUDED.proposer_index,
             proposed = EXCLUDED.proposed,
-            reward_total = EXCLUDED.reward_total,
-            reward_attestations = EXCLUDED.reward_attestations,
-            reward_sync = EXCLUDED.reward_sync,
-            reward_slashings = EXCLUDED.reward_slashings,
+            reward_total = COALESCE(EXCLUDED.reward_total, block_proposals.reward_total),
+            reward_attestations = COALESCE(EXCLUDED.reward_attestations, block_proposals.reward_attestations),
+            reward_sync = COALESCE(EXCLUDED.reward_sync, block_proposals.reward_sync),
+            reward_slashings = COALESCE(EXCLUDED.reward_slashings, block_proposals.reward_slashings),
             finalized = EXCLUDED.finalized
         WHERE block_proposals.finalized = FALSE
-           OR (EXCLUDED.finalized = TRUE AND block_proposals.reward_total IS NULL)
+           OR (EXCLUDED.finalized = TRUE AND NOT EXISTS (
+               SELECT 1 FROM completed_scans c
+               WHERE c.validator_index = block_proposals.proposer_index
+                 AND c.epoch = block_proposals.slot / $9))
         "#,
     )
     .bind(slot)
@@ -45,6 +49,7 @@ pub async fn upsert_block_proposal(
     .bind(reward_sync)
     .bind(reward_slashings)
     .bind(finalized)
+    .bind(crate::chain::slots_per_epoch() as i64)
     .execute(pool)
     .await
     .inspect_err(|_| {

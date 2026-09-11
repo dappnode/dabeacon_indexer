@@ -94,6 +94,7 @@ pub async fn process_epoch_attestation_duties(
         .into_iter()
         .map(|r| (r.validator_index, r))
         .collect();
+    super::validate_epoch_response(scan_validators, &attester_duties, &rewards_map)?;
 
     let wait_t = Instant::now();
     let (inclusions_res, inclusions_cpu_ms) = inclusions_handle
