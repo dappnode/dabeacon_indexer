@@ -8,7 +8,7 @@ COPY web/ ./
 RUN npm run build
 
 # ── Stage 2: Build the Rust binary ──────────────────────────────────────────
-FROM rust:1.95.0-alpine3.22 AS backend-builder
+FROM rust:1.96-alpine3.23 AS backend-builder
 
 RUN apk add --no-cache musl-dev pkgconf openssl-dev perl make
 
@@ -27,7 +27,7 @@ COPY migrations/ migrations/
 RUN touch src/main.rs && cargo build --release
 
 # ── Stage 3: Minimal runtime image ──────────────────────────────────────────
-FROM alpine:3.22
+FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates libssl3 tini
 
