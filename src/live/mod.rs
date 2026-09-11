@@ -147,21 +147,19 @@ async fn reconcile(
         tracing::warn!(start, previous = ?cursor, "Starting recent collection; earlier slots remain incomplete for backfill");
         *cursor = start.checked_sub(1);
     }
-    // Fetch current/next assignments before their state can disappear. A future
-    // epoch prefetch failure is never allowed to block current collection.
+    // Fetch current assignments before their state can disappear. Future epoch
+    // state IDs are legitimately unavailable on ordinary beacon nodes.
     let validators: Vec<u64> = tracked.iter().copied().collect();
-    for duty_epoch in epoch..=epoch.saturating_add(1) {
-        let result = async {
-            client.get_attester_duties(duty_epoch, &validators).await?;
-            client.get_committees(duty_epoch).await?;
-            client.get_proposer_duties(duty_epoch).await?;
-            client.get_sync_duties(duty_epoch, &validators).await?;
-            Ok::<(), Error>(())
-        }
-        .await;
-        if let Err(error) = result {
-            tracing::debug!(duty_epoch, %error, "Duty prefetch pending");
-        }
+    let result = async {
+        client.get_attester_duties(epoch, &validators).await?;
+        client.get_committees(epoch).await?;
+        client.get_proposer_duties(epoch).await?;
+        client.get_sync_duties(epoch, &validators).await?;
+        Ok::<(), Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(duty_epoch = epoch, %error, "Duty prefetch pending");
     }
     let scan_result =
         head::process_head_scan(client, pool, tracked, &head, cursor, &resolved, target).await;
@@ -182,6 +180,8 @@ async fn reconcile(
                 db_scanner::validators::active_validators_at(pool, &indices, reward_epoch as i64)
                     .await?;
             let active: Vec<i64> = active.into_iter().map(|v| v as i64).collect();
+            let active =
+                db_scanner::live::eligible_for_live_epoch(pool, &active, reward_epoch).await?;
             db_scanner::live::enqueue_jobs(
                 pool,
                 reward_epoch,
@@ -216,7 +216,7 @@ async fn reconcile(
         block: finality.data.finalized.root,
         epoch: finality.data.finalized.epoch,
     };
-    finalization::finalize_collected_evidence(client, pool, tracked, &finalized).await?;
+    finalization::finalize_collected_evidence(client, pool, &finalized).await?;
     let retain_epoch = min_epoch.min(finalized.epoch.saturating_sub(2));
     db_scanner::live::prune_completed_evidence(pool, retain_epoch).await?;
     client.prune_inputs_before(retain_epoch).await?;

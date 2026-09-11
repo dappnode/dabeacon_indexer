@@ -27,6 +27,8 @@
 		epoch: number;
 		previous_epoch?: number | null;
 		head_slot: number;
+		processed_slot?: number | null;
+		slots_per_epoch: number;
 		start_slot: number;
 		end_slot: number;
 		// Tracked validators in any sync committee covering this window.
@@ -224,12 +226,12 @@
 		return 'border border-gray-600 bg-gray-900 text-gray-400';
 	}
 
-	// Skipped slots render every duty pill/row as neutral grey regardless of the
-	// underlying outcome: the block didn't happen so there's nothing to reward
-	// or punish. We surface the cause with a "NO BLOCK" label.
-	function attestationLabel(outcome: AttestationOutcome, slotSkipped = false): string {
-		if (slotSkipped) return 'NO BLOCK';
-		if (outcome.included == null) return 'SCHEDULED';
+	function attestationLabel(outcome: AttestationOutcome, slot: number, data: LiveUpdate): string {
+		if (outcome.included == null) {
+			return data.processed_slot != null && slot <= data.processed_slot
+				? 'NOT OBSERVED YET'
+				: 'SCHEDULED';
+		}
 		return outcome.included ? 'ATTESTED' : 'ATTEST MISS';
 	}
 
@@ -323,9 +325,7 @@
 		return 'border-gray-800 bg-[linear-gradient(180deg,_rgba(17,24,39,0.88),_rgba(3,7,18,0.96))] hover:border-gray-700';
 	}
 
-	// A/S row inner rectangle: red only when the validator actually missed a
-	// duty. Skipped slots keep it neutral because the miss is structural
-	// (no block to attest to / participate in).
+	// A/S row inner rectangle: red only when the validator actually missed a duty.
 	function innerBoxClass(hasMiss: boolean): string {
 		return hasMiss
 			? 'border border-rose-500/60 bg-rose-950/30'
@@ -368,21 +368,21 @@
 	}
 
 	function isCurrentEpochBoundary(slot: number, data: LiveUpdate): boolean {
-		const boundary = data.epoch * 32;
+		const boundary = data.epoch * data.slots_per_epoch;
 		return data.start_slot < boundary && slot === boundary;
 	}
 
-	function isHeadSlot(slot: number, data: LiveUpdate): boolean {
-		return slot === data.head_slot;
+	function isProcessedSlot(slot: number, data: LiveUpdate): boolean {
+		return data.processed_slot != null && slot === data.processed_slot;
 	}
 
 	function groupSlotsByEpoch(slots: SlotData[], data: LiveUpdate) {
 		const groups: Array<{ epoch: number; slots: SlotData[] }> = [];
-		let currentEpoch = Math.floor(data.start_slot / 32);
+		let currentEpoch = Math.floor(data.start_slot / data.slots_per_epoch);
 		let currentGroup: SlotData[] = [];
 
 		for (const slot of slots) {
-			const slotEpoch = Math.floor(slot.slot / 32);
+			const slotEpoch = Math.floor(slot.slot / data.slots_per_epoch);
 			if (slotEpoch !== currentEpoch) {
 				if (currentGroup.length > 0) {
 					groups.push({ epoch: currentEpoch, slots: currentGroup });
@@ -457,7 +457,7 @@
 						{#each [...group.slots].reverse() as slot (slot.slot)}
 
 					<article
-						class={`group relative overflow-visible rounded-xl border p-2 transition-colors ${slotAccent(slot, currentData)} ${isHeadSlot(slot.slot, currentData) ? 'live-head-slot' : ''}`}
+						class={`group relative overflow-visible rounded-xl border p-2 transition-colors ${slotAccent(slot, currentData)} ${isProcessedSlot(slot.slot, currentData) ? 'live-processed-slot' : ''}`}
 						onmouseenter={(event) => updateTooltipPosition(slot.slot, event.currentTarget as HTMLElement)}
 						onmouseleave={() => clearTooltipPosition(slot.slot)}
 					>
@@ -465,7 +465,7 @@
 							<div class="min-w-0 flex-1">
 								<p class="text-[9px] uppercase tracking-[0.2em] text-gray-500">Slot</p>
 								<h3
-									class={`block w-full text-sm font-semibold leading-none ${isHeadSlot(slot.slot, currentData) ? 'head-slot-blink text-cyan-100' : 'text-white'}`}
+									class={`block w-full text-sm font-semibold leading-none ${isProcessedSlot(slot.slot, currentData) ? 'processed-slot-blink text-cyan-100' : 'text-white'}`}
 									use:fitText={{ minRem: 0.56, maxRem: 0.875, stepRem: 0.03125, paddingPx: 0 }}
 								>
 									{slot.slot}
@@ -481,14 +481,13 @@
 						</div>
 
 						<div class="space-y-2 text-[11px]">
-							<!-- A pills stay grey on skipped slots (rules 2/3: all duties grey). -->
-							<div class={`rounded-xl ${innerBoxClass(!slot.skipped && countMissedAttestations(slot) > 0)} px-2 py-1.5`}>
+							<div class={`rounded-xl ${innerBoxClass(countMissedAttestations(slot) > 0)} px-2 py-1.5`}>
 								<div class="flex items-center gap-1.5">
 									<span class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-gray-700 bg-gray-900 text-[9px] leading-none text-gray-300">A</span>
 								{#if slot.attestations.length > 0}
 									<div class="flex flex-wrap gap-1.5">
 										{#each slot.attestations as att (`att-pill-${slot.slot}-${att.validator_index}`)}
-											<span class={`h-2.5 w-3.5 rounded-full ${pillClass(att.included, slot.skipped)}`}></span>
+											<span class={`h-2.5 w-3.5 rounded-full ${pillClass(att.included)}`}></span>
 										{/each}
 									</div>
 								{/if}
@@ -520,10 +519,10 @@
 										{#if slot.attestations.length > 0}
 											<div class="space-y-1.5">
 												{#each slot.attestations as att (`att-${slot.slot}-${att.validator_index}`)}
-													<div class={`rounded-xl px-2.5 py-2 ${rowColor(att.included, slot.skipped)}`}>
+													<div class={`rounded-xl px-2.5 py-2 ${rowColor(att.included)}`}>
 														<div class="flex items-start justify-between gap-2">
 															<span class="font-semibold">V{att.validator_index}</span>
-															<span class="font-medium">{attestationLabel(att, slot.skipped)}</span>
+															<span class="font-medium">{attestationLabel(att, slot.slot, currentData)}</span>
 														</div>
 													</div>
 												{/each}
@@ -594,7 +593,7 @@
 		background-color: #030712;
 	}
 
-	@keyframes head-slot-blink {
+	@keyframes processed-slot-blink {
 		0%,
 		45%,
 		100% {
@@ -606,11 +605,11 @@
 		}
 	}
 
-	.live-head-slot {
+	.live-processed-slot {
 		box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.4), 0 0 20px rgba(34, 211, 238, 0.18);
 	}
 
-	.head-slot-blink {
-		animation: head-slot-blink 1.2s step-end infinite;
+	.processed-slot-blink {
+		animation: processed-slot-blink 1.2s step-end infinite;
 	}
 </style>

@@ -290,6 +290,7 @@ export function epochTime(epoch: number): string {
 export function timeAgo(slot: number): string {
 	const ts = chainConfig.genesis_time + slot * chainConfig.seconds_per_slot;
 	const diff = Math.floor(Date.now() / 1000) - ts;
+	if (diff < 0) return `in ${formatDuration(-diff)}`;
 	return `${formatDuration(diff)} ago`;
 }
 

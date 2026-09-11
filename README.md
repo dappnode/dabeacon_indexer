@@ -190,7 +190,7 @@ On startup the indexer:
 5. The web server runs from startup with both DB reads and the SSE stream.
 6. A periodic reconcile task re-fetches active validators' state every epoch so exits land in the DB without a process restart.
 
-Live evidence promotion and historical backfill use the same conservative finality boundary: epoch E is safe when checkpoint E+2 is finalized. A finalized checkpoint anchors an epoch's start, and attestations from E can still be included through E+1. `completed_scans` records successful scans separately from on-chain finality. Incomplete finalized rows can be repaired by a later finalized scan; live writes cannot overwrite them.
+Historical backfill and complete live scans use the same conservative completion boundary: epoch E is complete when checkpoint E+2 is finalized, because attestations from E can still be included through E+1. Individual positive duty outcomes can become final sooner: an observed attestation is final when its inclusion block is on finalized ancestry, and proposal/sync outcomes are final when their slot is behind the finalized checkpoint. Attestation absence remains unknown until the full inclusion window is covered. Reward availability does not delay these finality flags. `completed_scans` records complete data separately from on-chain finality. Incomplete finalized rows can be repaired by a later finalized scan; live writes cannot overwrite them.
 
 ### `backfill` only
 
@@ -349,7 +349,7 @@ Fixtures live under `testdata/blocks/` â€” one captured block per fork (phase0 â
 ### Key invariants (before touching the scanner / DB)
 
 1. **Backfill must always pass `finalized=true` to `scan_epoch`.** Only scan through `chain::finalized_scan_target`; finalized rows are immune to reorg deletes and live overwrites.
-2. **Live writes remain provisional** until stored dependencies connect to finalized ancestry. Coverage and applicable reward jobs must be complete before promotion.
+2. **Live writes remain provisional** until stored dependencies connect to finalized ancestry. Positive duty observations may then become final independently of rewards; proven misses and `completed_scans` retain their full coverage requirements.
 3. **Upserts protect completed finalized scans.** Incomplete finalized rows remain repairable; live writes cannot replace finalized rows.
 4. **Reorg deletes only match `finalized = FALSE`.** Same reasoning.
 5. **Malformed data is always fatal to the epoch**, never silently tolerated. See `Error::InconsistentBeaconData`.

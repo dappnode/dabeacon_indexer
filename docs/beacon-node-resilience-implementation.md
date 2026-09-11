@@ -5,10 +5,10 @@ Implementation notes for [R1–R9](beacon-node-resilience-issues.md).
 | R1 | Parent-root resolution proves skipped slots; named-root failures never trigger competing slot substitutions. |
 | R2 | Metadata-preserving requests reject explicit optimism. Recent ancestry, input anchors, and staged reward dependencies are retained. Epoch rewards are bracketed with state/boundary checks. |
 | R3 | Per-validator component jobs survive errors and restart, use bounded time-based retries, and retain old gaps for backfill. Metrics expose pending work and its oldest epoch. |
-| R4 | Duties and mappings persist in a canonical-anchor-validated cache. Current/next inputs are prefetched where available. Reorgs invalidate reuse when anchors change. |
+| R4 | Duties and mappings persist in a canonical-anchor-validated cache. Current inputs are prefetched before recent processing; future state IDs are not assumed available. Reorgs invalidate reuse when anchors change. |
 | R5 | Attestation reward collection is independent of old committee lookup; proposal/sync rewards are collected by recent block root. Staging precedes result-table joins. |
 | R6 | A bounded SSE notification channel and polling wake one writer. Root reconciliation detects a reorg even when its event was missed. New slots take priority over older coverage gaps. |
-| R7 | Finality promotes connected, complete stored evidence without historical-state rescans. The separate archive worker continues repairing persisted live gaps after initial catch-up. |
+| R7 | Finality promotes connected stored evidence without historical-state rescans. Positive duty observations become final independently of rewards; misses and complete scans retain their coverage/readiness requirements. The separate archive worker continues repairing persisted live gaps after initial catch-up. |
 | R8 | Zero rewards do not imply non-inclusion. Unknown inclusions remain nullable in REST/live views and are excluded from miss counts. Sparse vote correctness is unknown unless positive rewards prove correctness. |
 | R9 | Configurable two-slot initial lag, retry window, and polling interval. The readiness probe compares offsets 0/1/2/4, sync rewards, and epoch reward readiness. Real-client timing is still unmeasured. |
 
@@ -20,8 +20,8 @@ All pending schema work is consolidated in `migrations/002_epoch_scan_completion
 
 Validation:
 
-- 87 Rust tests passed, including seven recovery tests using fresh isolated schemas in disposable PostgreSQL. Two tests requiring a real beacon endpoint were excluded.
-- Regressions cover fork mixing, reconnect/poll reorg recovery, durable inputs after pruning/restart, retry scheduling, zero-reward inclusion, staged rewards joined after duties arrive, complete-coverage finalization, and preservation of finalized archive rows.
+- 89 Rust tests passed, including recovery tests using fresh isolated schemas in disposable PostgreSQL. Two tests requiring a real beacon endpoint were excluded.
+- Regressions cover fork mixing, reconnect/poll reorg recovery, durable inputs after pruning/restart, retry scheduling, zero-reward inclusion, staged rewards joined after duties arrive, early finalization of observed inclusions, complete-coverage finalization, and preservation of finalized archive rows.
 - `cargo clippy --offline --all-targets -- -D warnings` passed.
 - Frontend type-check and production build passed; the existing unrelated autofocus accessibility warning remains.
 - Readiness probe smoke test passed against a local mock, including block offsets and sync rewards.

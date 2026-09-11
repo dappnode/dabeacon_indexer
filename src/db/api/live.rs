@@ -14,6 +14,10 @@ pub type SyncStatusMap = HashMap<(u64, u64), (bool, bool)>;
 /// `slot -> (proposer, proposed)`.
 pub type ProposalStatusMap = HashMap<u64, (u64, bool)>;
 
+pub async fn processed_tip(pool: &Pool, tracked: &[i64]) -> Result<Option<u64>> {
+    crate::db::scanner::live::processed_tip(pool, tracked).await
+}
+
 /// Only processed ancestry can establish a skipped slot; a slot API 404 alone
 /// could also mean unavailable data or a fork-choice race.
 pub async fn fetch_block_presence(

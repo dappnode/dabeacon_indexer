@@ -21,13 +21,13 @@ pub struct LiveSseQuery {
     pub api_key: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AttestationOutcome {
     pub validator_index: u64,
     pub included: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct LiveSlot {
     pub slot: u64,
     pub block: bool,
@@ -44,11 +44,13 @@ pub struct LiveSlot {
     pub sync: Vec<Option<bool>>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct LiveUpdate {
     pub epoch: u64,
     pub previous_epoch: Option<u64>,
     pub head_slot: u64,
+    pub processed_slot: Option<u64>,
+    pub slots_per_epoch: u64,
     pub start_slot: u64,
     pub end_slot: u64,
     /// Tracked validators in any sync committee covering this window.
@@ -75,45 +77,38 @@ pub async fn live_sse(
 
     // Refresh on every broadcast event, on lag, and at least every 6s. Close
     // the stream only when the broadcaster drops.
-    let stream = stream::unfold((true, receiver), move |(first, mut rx)| {
-        let app_state = app_state.clone();
-        async move {
-            if !first
-                && let Ok(Err(broadcast::error::RecvError::Closed)) =
-                    tokio::time::timeout(Duration::from_secs(6), rx.recv()).await
-            {
-                return None;
+    let stream = stream::unfold(
+        (true, receiver, None::<LiveUpdate>),
+        move |(first, mut rx, last)| {
+            let app_state = app_state.clone();
+            async move {
+                if !first
+                    && let Ok(Err(broadcast::error::RecvError::Closed)) =
+                        tokio::time::timeout(Duration::from_secs(6), rx.recv()).await
+                {
+                    return None;
+                }
+                let (event, next_last) = match build_live_update(&app_state).await {
+                    Ok(data) => {
+                        let next_last = Some(data.clone());
+                        (Event::default().json_data(data).unwrap(), next_last)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Live UI refresh failed; retaining last complete payload");
+                        match last.clone() {
+                            Some(data) => {
+                                let next_last = Some(data.clone());
+                                (Event::default().json_data(data).unwrap(), next_last)
+                            }
+                            None => (Event::default().comment("live data pending"), None),
+                        }
+                    }
+                };
+                Some((Ok(event), (false, rx, next_last)))
             }
-            let data = build_live_update(&app_state)
-                .await
-                .unwrap_or_else(|_| empty_live_update());
-            let event = Event::default().json_data(data).unwrap();
-            Some((Ok(event), (false, rx)))
-        }
-    });
+        },
+    );
     Ok(Sse::new(stream))
-}
-
-fn empty_live_update() -> LiveUpdate {
-    LiveUpdate {
-        epoch: 0,
-        previous_epoch: None,
-        head_slot: 0,
-        start_slot: 0,
-        end_slot: chain::slots_per_epoch(),
-        sync_committee: Vec::new(),
-        slots: (0..chain::slots_per_epoch())
-            .map(|slot| LiveSlot {
-                slot,
-                block: false,
-                skipped: false,
-                proposer: None,
-                proposed: None,
-                attestations: Vec::new(),
-                sync: Vec::new(),
-            })
-            .collect(),
-    }
 }
 
 async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
@@ -124,6 +119,7 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
     let tracked_i64: Vec<i64> = tracked.iter().map(|&v| v as i64).collect();
 
     let head_slot = beacon_client.get_head_slot().await?;
+    let processed_slot = db_live::processed_tip(pool, &tracked_i64).await?;
     let current_epoch = slot_to_epoch(head_slot);
     let previous_epoch = (current_epoch > 0).then_some(current_epoch - 1);
     let start_epoch = previous_epoch.unwrap_or(current_epoch);
@@ -231,6 +227,8 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
         epoch: current_epoch,
         previous_epoch,
         head_slot,
+        processed_slot,
+        slots_per_epoch: chain::slots_per_epoch(),
         start_slot,
         end_slot,
         sync_committee,

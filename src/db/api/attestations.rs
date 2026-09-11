@@ -13,6 +13,7 @@ pub struct AttestationFilter {
     pub validator_indices: Option<Vec<i64>>,
     pub epoch_from: Option<i64>,
     pub epoch_to: Option<i64>,
+    pub assigned_slot_to: Option<i64>,
     pub included: Option<bool>,
     pub head_correct: Option<bool>,
     pub target_correct: Option<bool>,
@@ -129,6 +130,9 @@ pub async fn list_attestation_duties_paginated(
             if let Some(v) = $f.epoch_to {
                 q = q.bind(v);
             }
+            if let Some(v) = $f.assigned_slot_to {
+                q = q.bind(v);
+            }
             if let Some(v) = $f.included {
                 q = q.bind(v);
             }
@@ -219,6 +223,9 @@ fn build_where(f: &AttestationFilter) -> String {
     if f.epoch_to.is_some() {
         conds.push(format!("epoch <= ${}", next()));
     }
+    if f.assigned_slot_to.is_some() {
+        conds.push(format!("assigned_slot <= ${}", next()));
+    }
     if f.included.is_some() {
         conds.push(format!("included = ${}", next()));
         if f.included == Some(false) {
@@ -248,5 +255,19 @@ fn build_where(f: &AttestationFilter) -> String {
         String::new()
     } else {
         format!("WHERE {}", conds.join(" AND "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn future_duties_can_be_bounded_by_observed_head() {
+        let filter = AttestationFilter {
+            assigned_slot_to: Some(123),
+            ..Default::default()
+        };
+        assert_eq!(build_where(&filter), "WHERE assigned_slot <= $1");
     }
 }

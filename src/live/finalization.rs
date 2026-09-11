@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::beacon_client::BeaconClient;
 use crate::beacon_client::types::{BlockRoot, FinalizedCheckpointEvent};
@@ -11,7 +11,6 @@ use crate::error::{Error, Result};
 pub(super) async fn finalize_collected_evidence(
     client: &BeaconClient,
     pool: &PgPool,
-    scan_validators: &HashSet<u64>,
     finalized: &FinalizedCheckpointEvent,
 ) -> Result<()> {
     let timer = crate::metrics::LIVE_FINALIZED_RESCAN_DURATION
@@ -43,8 +42,11 @@ pub(super) async fn finalize_collected_evidence(
         .into_iter()
         .map(|(_, root)| root.to_string())
         .collect();
-    let indices: Vec<i64> = scan_validators.iter().map(|v| *v as i64).collect();
-    let completed = promote_collected(pool, &indices, target, floor, &roots).await?;
+    // Validators removed from the current config can still have provisional
+    // evidence collected in an earlier run. Finish that evidence too.
+    let indices = live::tracked_validators(pool).await?;
+    let completed =
+        promote_collected(pool, &indices, target, finalized.epoch, floor, &roots).await?;
     tracing::debug!(
         target,
         completed,
@@ -81,7 +83,8 @@ fn confirmed_ancestry(
 async fn promote_collected(
     pool: &PgPool,
     validators: &[i64],
-    target: u64,
+    completion_target: u64,
+    finalized_epoch: u64,
     floor: u64,
     roots: &[String],
 ) -> Result<u64> {
@@ -107,7 +110,7 @@ async fn promote_collected(
     )
     .bind(roots)
     .bind(validators)
-    .bind(target as i64)
+    .bind(completion_target as i64)
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE block_proposals p SET reward_total=(j.payload->>'total')::BIGINT,
@@ -120,7 +123,7 @@ async fn promote_collected(
           AND (j.payload->>'proposer_index')::BIGINT=p.proposer_index
           AND NOT EXISTS (SELECT 1 FROM completed_scans c
               WHERE c.validator_index=p.proposer_index AND c.epoch=j.epoch)")
-        .bind(roots).bind(validators).bind(target as i64).execute(&mut *tx).await?;
+        .bind(roots).bind(validators).bind(finalized_epoch as i64).execute(&mut *tx).await?;
     sqlx::query(
         "UPDATE sync_duties s SET reward=(r->>'reward')::BIGINT
         FROM live_jobs j CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(j.payload) r
@@ -133,7 +136,23 @@ async fn promote_collected(
     )
     .bind(roots)
     .bind(validators)
-    .bind(target as i64)
+    .bind(finalized_epoch as i64)
+    .execute(&mut *tx)
+    .await?;
+
+    // An observed inclusion is a complete duty-performance fact as soon as
+    // its including block is on finalized ancestry. Reward computation and a
+    // proof of non-inclusion have later readiness boundaries.
+    sqlx::query(
+        "UPDATE attestation_duties a SET inclusion_known=TRUE,finalized=TRUE
+         WHERE a.validator_index=ANY($1) AND a.included AND a.inclusion_slot IS NOT NULL
+           AND a.inclusion_slot >= $2
+           AND EXISTS (SELECT 1 FROM live_blocks b
+               WHERE b.slot=a.inclusion_slot AND b.root=ANY($3))",
+    )
+    .bind(validators)
+    .bind(floor as i64)
+    .bind(roots)
     .execute(&mut *tx)
     .await?;
 
@@ -147,7 +166,7 @@ async fn promote_collected(
                WHERE b.slot=a.inclusion_slot AND b.root=ANY($5)))",
     )
     .bind(validators)
-    .bind(target as i64)
+    .bind(completion_target as i64)
     .bind(spe)
     .bind(floor as i64)
     .bind(roots)
@@ -167,7 +186,7 @@ async fn promote_collected(
                 WHERE b.slot=a.inclusion_slot AND b.root=ANY($5)))",
     )
     .bind(validators)
-    .bind(target as i64)
+    .bind(completion_target as i64)
     .bind(spe)
     .bind(floor as i64)
     .bind(roots)
@@ -186,7 +205,7 @@ async fn promote_collected(
         };
         let sql = format!(
             "UPDATE {table} d SET finalized=TRUE
-             WHERE d.{owner}=ANY($1) AND d.slot/$2 <= $3 AND d.slot >= $4
+             WHERE d.{owner}=ANY($1) AND d.slot/$2 < $3 AND d.slot >= $4
                AND EXISTS (SELECT 1 FROM live_coverage c
                     WHERE c.validator_index=d.{owner} AND c.slot=d.slot)
                AND (({present} AND EXISTS (SELECT 1 FROM live_blocks b
@@ -197,7 +216,7 @@ async fn promote_collected(
         sqlx::query(&sql)
             .bind(validators)
             .bind(spe)
-            .bind(target as i64)
+            .bind(finalized_epoch as i64)
             .bind(floor as i64)
             .bind(roots)
             .execute(&mut *tx)
@@ -227,7 +246,7 @@ async fn promote_collected(
                    (SELECT 1 FROM live_jobs j WHERE j.validator_index=a.validator_index AND j.slot=s.slot
                     AND j.component='sync_rewards' AND j.status='complete' AND j.dependency=ANY($5))))
           AND NOT EXISTS (SELECT 1 FROM completed_scans c WHERE c.validator_index=a.validator_index AND c.epoch=a.epoch)")
-        .bind(validators).bind(target as i64).bind(spe).bind(floor as i64).bind(roots)
+        .bind(validators).bind(completion_target as i64).bind(spe).bind(floor as i64).bind(roots)
         .fetch_all(&mut *tx).await?;
     for &(validator, epoch) in &ready {
         sqlx::query(
@@ -262,7 +281,7 @@ async fn promote_collected(
            reason=EXCLUDED.reason,updated_at=NOW()",
     )
     .bind(validators)
-    .bind(target as i64)
+    .bind(completion_target as i64)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -411,7 +430,7 @@ mod tests {
         }
         let roots: Vec<String> = (1..=65).map(|i| root(i).to_string()).collect();
         assert_eq!(
-            promote_collected(&pool, &[validator], epoch, start, &roots)
+            promote_collected(&pool, &[validator], epoch, epoch + 2, start, &roots)
                 .await
                 .unwrap(),
             0
@@ -420,7 +439,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            promote_collected(&pool, &[validator], epoch, start, &roots)
+            promote_collected(&pool, &[validator], epoch, epoch + 2, start, &roots)
                 .await
                 .unwrap(),
             1
@@ -436,7 +455,7 @@ mod tests {
         .unwrap();
         assert_eq!(rewards, (9, 6));
         assert_eq!(
-            promote_collected(&pool, &[validator], epoch, start, &roots)
+            promote_collected(&pool, &[validator], epoch, epoch + 2, start, &roots)
                 .await
                 .unwrap(),
             0
@@ -495,7 +514,7 @@ mod tests {
         }
 
         assert_eq!(
-            promote_collected(&pool, &[validator], epoch, start, &[])
+            promote_collected(&pool, &[validator], epoch, epoch + 2, start, &[])
                 .await
                 .unwrap(),
             0
@@ -528,6 +547,74 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(completed, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn observed_inclusion_finalizes_before_rewards_or_miss_window() {
+        use crate::db::scanner::{attestations, validators};
+        let pool = crate::db::isolated_test_pool().await;
+        let validator = 99192;
+        let epoch = 20u64;
+        let duty_slot = crate::chain::epoch_start_slot(epoch);
+        let inclusion_slot = duty_slot + 1;
+        let inclusion_root = root(91);
+        validators::upsert_validator(&pool, validator, &[19], 0, None)
+            .await
+            .unwrap();
+        live::register_tracking_start(&pool, &[validator], epoch)
+            .await
+            .unwrap();
+        attestations::upsert_attestation_duty(
+            &pool,
+            validator,
+            epoch as i64,
+            duty_slot as i64,
+            0,
+            0,
+            true,
+            Some(inclusion_slot as i64),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        live::record_block(&pool, inclusion_slot, &inclusion_root, &root(90))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            promote_collected(
+                &pool,
+                &[validator],
+                epoch - 1,
+                epoch + 1,
+                inclusion_slot,
+                &[inclusion_root.to_string()],
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let status: (bool, bool, Option<i64>) = sqlx::query_as(
+            "SELECT finalized,inclusion_known,source_reward FROM attestation_duties
+             WHERE validator_index=$1 AND epoch=$2",
+        )
+        .bind(validator)
+        .bind(epoch as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, (true, true, None));
         pool.close().await;
     }
 }

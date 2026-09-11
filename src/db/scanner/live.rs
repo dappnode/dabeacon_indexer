@@ -14,6 +14,7 @@ pub struct LiveJob {
 }
 
 pub async fn register_tracking_start(pool: &Pool, validators: &[i64], epoch: u64) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO live_tracking_start(validator_index,started_epoch)
          SELECT UNNEST($1::BIGINT[]),$2
@@ -22,9 +23,48 @@ pub async fn register_tracking_start(pool: &Pool, validators: &[i64], epoch: u64
     )
     .bind(validators)
     .bind(epoch as i64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "DELETE FROM live_jobs j USING live_tracking_start t
+         WHERE j.validator_index=t.validator_index AND j.epoch<t.started_epoch
+           AND NOT EXISTS (SELECT 1 FROM completed_scans c
+               WHERE c.validator_index=j.validator_index AND c.epoch=j.epoch)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM live_gaps g USING live_tracking_start t
+         WHERE g.validator_index=t.validator_index AND g.epoch<t.started_epoch",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+pub async fn eligible_for_live_epoch(
+    pool: &Pool,
+    validators: &[i64],
+    epoch: u64,
+) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT validator_index FROM live_tracking_start
+         WHERE validator_index=ANY($1) AND started_epoch<=$2
+         ORDER BY validator_index",
+    )
+    .bind(validators)
+    .bind(epoch as i64)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn tracked_validators(pool: &Pool) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT validator_index FROM live_tracking_start ORDER BY validator_index",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 pub async fn record_block(
@@ -299,6 +339,26 @@ mod tests {
         super::super::validators::upsert_validator(&pool, 1, &[1], 0, None)
             .await
             .unwrap();
+        enqueue_jobs(&pool, 19, None, "attestation_rewards", &[1], None)
+            .await
+            .unwrap();
+        register_tracking_start(&pool, &[1], 20).await.unwrap();
+        assert!(
+            eligible_for_live_epoch(&pool, &[1], 19)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            eligible_for_live_epoch(&pool, &[1], 20).await.unwrap(),
+            vec![1]
+        );
+        let pre_tracking_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM live_jobs WHERE epoch=19")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pre_tracking_jobs, 0);
         enqueue_jobs(&pool, 20, None, "attestation_rewards", &[1], None)
             .await
             .unwrap();

@@ -299,14 +299,14 @@
 						<td class="px-3 py-1.5 text-xs text-gray-400" title={slotTime(r.assigned_slot)}>{timeAgo(r.assigned_slot)}</td>
 						<td class="px-3 py-1.5">
 							{#if r.included}
-								<span class="text-green-400">Included</span>
+								<span class="text-green-400">Observed</span>
 								{#if r.inclusion_delay !== null}
 									<span class="text-gray-500 text-xs ml-1">(slot {r.inclusion_slot})</span>
 								{/if}
 							{:else if r.included === false}
 								<span class="text-red-400 font-bold">MISSED</span>
 							{:else}
-								<span class="text-gray-400">Unknown</span>
+								<span class="text-amber-300">Not observed yet</span>
 							{/if}
 						</td>
 						<td class="px-3 py-1.5">
