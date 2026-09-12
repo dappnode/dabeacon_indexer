@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getAttestations, getStats, getValidators, getMeta, pct, eth, slotTime, timeAgo, beaconchainUrl, type AttestationRow, type Paginated, type ValidatorSummary, type MetaResponse, type Stats } from '$lib/api';
+	import { getAttestations, getStats, getValidators, getMeta, pct, eth, slotTime, timeAgo, slotsPerEpoch, beaconchainUrl, type AttestationRow, type Paginated, type ValidatorSummary, type MetaResponse, type Stats } from '$lib/api';
 	import ValidatorPicker from '$lib/ValidatorPicker.svelte';
 	import RangeInput from '$lib/RangeInput.svelte';
+	import VoteStatus from '$lib/VoteStatus.svelte';
 	import { cardSurface, tableSurface, tableHeaderRow, tableBodyRow, btnNeutral, btnDanger, btnWarn, btnOrange, segIdle, segActive } from '$lib/ui';
 
 	let validators: ValidatorSummary[] = $state([]);
@@ -139,7 +140,7 @@
 	}
 
 	function slotInEpoch(slot: number): number {
-		return (slot % 32) + 1;
+		return (slot % slotsPerEpoch()) + 1;
 	}
 
 	onMount(async () => {
@@ -167,6 +168,7 @@
 <svelte:head><title>Attestations - Beacon Indexer</title></svelte:head>
 
 <h1 class="text-2xl font-bold mb-4">Attestation Duties</h1>
+<p class="text-sm text-gray-400 mb-4">Included attestations and confirmed misses. Results remain provisional until finalized; rewards arrive later. Head, target and source compare votes with the chain, independently of rewards.</p>
 
 <!-- Quick filter buttons -->
 <div class="flex gap-2 mb-4 flex-wrap">
@@ -294,12 +296,12 @@
 							<span
 									class="ml-1 text-[11px] text-gray-500 cursor-help"
 									title="Position of this slot within its epoch."
-								>({slotInEpoch(r.assigned_slot)}/32)</span>
+								>({slotInEpoch(r.assigned_slot)}/{slotsPerEpoch()})</span>
 						</td>
 						<td class="px-3 py-1.5 text-xs text-gray-400" title={slotTime(r.assigned_slot)}>{timeAgo(r.assigned_slot)}</td>
 						<td class="px-3 py-1.5">
 							{#if r.included}
-								<span class="text-green-400">Observed</span>
+								<span class="text-green-400">Included</span>
 								{#if r.inclusion_delay !== null}
 									<span class="text-gray-500 text-xs ml-1">(slot {r.inclusion_slot})</span>
 								{/if}
@@ -311,7 +313,11 @@
 						</td>
 						<td class="px-3 py-1.5">
 							{#if r.effective_inclusion_delay === null}
-								-
+								{#if r.inclusion_delay !== null}
+									<span title="Raw inclusion delay in slots. Adjustment for skipped blocks is unavailable.">{r.inclusion_delay} raw</span>
+								{:else}
+									<span class="text-gray-500">{r.included === false ? 'N/A' : 'Pending'}</span>
+								{/if}
 							{:else}
 								<span
 									class="cursor-help"
@@ -327,17 +333,17 @@
 							{/if}
 						</td>
 						<td class="px-3 py-1.5">
-							{#if r.head_correct === null}-{:else if r.head_correct}<span class="text-green-400">OK</span>{:else}<span class="text-red-400">WRONG</span>{/if}
+							<VoteStatus correct={r.head_correct} included={r.included} finalized={r.finalized} />
 						</td>
 						<td class="px-3 py-1.5">
-							{#if r.target_correct === null}-{:else if r.target_correct}<span class="text-green-400">OK</span>{:else}<span class="text-red-400">WRONG</span>{/if}
+							<VoteStatus correct={r.target_correct} included={r.included} finalized={r.finalized} />
 						</td>
 						<td class="px-3 py-1.5">
-							{#if r.source_correct === null}-{:else if r.source_correct}<span class="text-green-400">OK</span>{:else}<span class="text-red-400">WRONG</span>{/if}
+							<VoteStatus correct={r.source_correct} included={r.included} finalized={r.finalized} />
 						</td>
 						<td class="px-3 py-1.5 text-right font-mono text-xs" class:text-red-400={r.source_reward !== null && r.source_reward < 0}>{eth(r.source_reward)}</td>
 						<td class="px-3 py-1.5 text-right font-mono text-xs" class:text-red-400={r.target_reward !== null && r.target_reward < 0}>{eth(r.target_reward)}</td>
-						<td class="px-3 py-1.5 text-right font-mono text-xs" class:text-red-400={r.head_reward !== null && r.head_reward < 0}>{eth(r.head_reward)}</td>
+						<td class="px-3 py-1.5 text-right font-mono text-xs" title={r.head_reward === 0 ? 'Zero head reward does not imply a wrong vote. A correct head vote included after more than one slot does not earn the timely-head reward.' : undefined} class:text-red-400={r.head_reward !== null && r.head_reward < 0}>{eth(r.head_reward)}</td>
 						<td class="px-3 py-1.5 text-right font-mono text-xs font-bold" class:text-green-400={r.total_reward !== null && r.total_reward > 0} class:text-red-400={r.total_reward !== null && r.total_reward < 0}>{eth(r.total_reward)}</td>
 						<td class="px-3 py-1.5 text-center">{r.finalized ? 'Y' : 'N'}</td>
 					</tr>

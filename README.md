@@ -160,7 +160,7 @@ tags = ["pool-a", "node-2"]
 | `--mode` / `RUN_MODE` | `both` | Which workloads to run: `live` (head tracking + finality rescans + web server only — no historical backfill), `backfill` (one-shot historical catch-up, no live, no web), or `both`. See [Running modes](#running-modes). |
 | `--max-backfill-depth` / `MAX_BACKFILL_DEPTH` | *(unlimited)* | Clamp the earliest epoch backfill will start from. Protects against accidentally re-scanning from genesis for a newly-added validator. |
 | `--non-contiguous-backfill` / `NON_CONTIGUOUS_BACKFILL` | `false` | Walk every epoch in the backfill range and scan only those (validator, epoch) pairs that don't already have a completed scan. Use after widening validator set or reducing `max_backfill_depth`. |
-| `--scan-mode` / `SCAN_MODE` | `auto` | Attestation scan strategy. `dense` fetches every block in the epoch and derives correctness from attestations vs the canonical chain — amortises well for 30+ validators. `sparse` scans forward per duty and uses positive rewards as evidence of vote correctness; zero rewards never establish a miss. `auto` resolves to `sparse` when 5 or fewer validators are tracked. See [scan mode semantics](#attestation-scan-modes). |
+| `--scan-mode` / `SCAN_MODE` | `auto` | Attestation scan strategy. `dense` fetches every block in the epoch and derives correctness from attestations vs the canonical chain — amortises well for 30+ validators. `sparse` scans forward per duty and compares observed votes with canonical duty/boundary roots; zero rewards never establish a miss. `auto` resolves to `sparse` when 5 or fewer validators are tracked. See [scan mode semantics](#attestation-scan-modes). |
 
 ### Web server
 
@@ -262,9 +262,9 @@ Fetches duties, rewards, and committees, then scans forward for every tracked du
 
 ### Correctness fields
 
-Both modes use `*_correct` for vote correctness. Dense mode compares votes with canonical context. Sparse mode records `true` when a positive reward proves a correct vote; otherwise the flag remains `null` rather than falsely claiming an incorrect vote. A dense repair can refine unknown flags. Conflicting multiple attestations are not modeled as separate votes; the fields summarize available evidence.
+Both modes use `*_correct` for vote correctness and compare observed votes with canonical roots. Live collection does the same immediately, independently of rewards. A correct but late head vote can earn zero head reward. Conflicting multiple attestations are not modeled as separate votes; the fields describe the earliest observed inclusion.
 
-`included` is `true` for observed inclusion, `false` for a proven miss, and `null` for incomplete coverage in the REST and live APIs. Unknown duties are excluded from missed-duty counts and participation-rate denominators. Reward values remain nullable when unavailable. Effective inclusion delay also remains unknown when skipped-slot coverage is insufficient.
+`included` is `true` for observed inclusion, `false` for a proven miss, and `null` for incomplete coverage in live views. The attestation list returns only included attestations and proven misses, excluding pending assignment seeds. Unknown duties are excluded from missed-duty counts and participation-rate denominators. Reward values remain nullable when unavailable. Live collection derives adjusted delay from resolved ancestry; legacy rows with unavailable ancestry show their raw delay and explicit unknown vote results. See [live collection and field semantics](docs/live-collection.md) for finality, repair, and readiness behavior.
 
 ---
 

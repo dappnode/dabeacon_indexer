@@ -10,6 +10,7 @@
 	interface AttestationOutcome {
 		validator_index: number;
 		included: boolean | null;
+		inclusion_slot: number | null;
 	}
 
 	interface SlotData {
@@ -513,6 +514,9 @@
 						<div class={`pointer-events-none absolute z-20 hidden w-64 group-hover:block xl:w-72 ${tooltipAboveSlots[slot.slot] ? 'bottom-full pb-2' : 'top-full pt-2'} ${tooltipHorizontalAlign[slot.slot] === 'left' ? 'left-0' : tooltipHorizontalAlign[slot.slot] === 'right' ? 'right-0' : 'left-1/2 -translate-x-1/2'}`}>
 							<div class="rounded-2xl border border-gray-700 bg-gray-950/98 p-3 shadow-2xl backdrop-blur">
 								<p class="mb-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-gray-500">Slot {slot.slot} details</p>
+								{#if slot.skipped}
+									<p class="mb-3 text-xs text-gray-400">No block was proposed. Attestations assigned here can still be included in a later block.</p>
+								{/if}
 								<div class="space-y-3 text-xs">
 									<div>
 										<p class="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-500">Attestation duties</p>
@@ -524,6 +528,9 @@
 															<span class="font-semibold">V{att.validator_index}</span>
 															<span class="font-medium">{attestationLabel(att, slot.slot, currentData)}</span>
 														</div>
+														{#if att.included && att.inclusion_slot != null}
+															<p class="mt-1 text-gray-400">Included in slot {att.inclusion_slot}</p>
+														{/if}
 													</div>
 												{/each}
 											</div>
