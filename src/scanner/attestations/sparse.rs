@@ -6,9 +6,8 @@
 //! Every duty is scanned through its full inclusion window, including when all
 //! rewards are zero (for example during an inactivity leak). `included` records
 //! observed inclusion independently of rewards. The shared `*_correct` contract
-//! is vote correctness: a positive reward proves a correct vote, while zero or
-//! negative rewards leave correctness unknown without canonical vote context.
-//! Dense archive scans may refine unknown flags using that context.
+//! is vote correctness: compare the observed vote to canonical duty/boundary
+//! roots even when rewards are zero. Valid block inclusion verifies the source.
 
 use std::collections::{HashMap, HashSet};
 
@@ -139,7 +138,18 @@ pub async fn process_epoch_attestation_duties_sparse(
         }
         scan_ms += scan_t.elapsed().as_millis() as u64;
 
-        let row = derive_sparse_row(duty, reward, found_inclusion_slot);
+        let mut row = derive_sparse_row(
+            duty,
+            reward,
+            found_inclusion_slot
+                .as_ref()
+                .map(|(inc, missed)| (inc.inclusion_slot, *missed)),
+        );
+        if let Some((inc, _)) = &found_inclusion_slot {
+            row.source_correct = Some(inc.source_correct);
+            row.target_correct = Some(inc.target_correct);
+            row.head_correct = Some(inc.head_correct);
+        }
         if row.included {
             included_count += 1;
         } else {
@@ -206,8 +216,8 @@ pub async fn process_epoch_attestation_duties_sparse(
     Ok(())
 }
 
-/// Walk slots after `duty.slot` up to one epoch later, returning
-/// `(inclusion_slot, missed_slots_in_between)` on the first match. The second
+/// Walk through the end of the following epoch, returning
+/// `(inclusion, missed_slots_in_between)` on the first match. The second
 /// value — slots in `(duty.slot, inclusion_slot)` with no block — feeds
 /// `effective_inclusion_delay`. `block_fetches` is incremented per `get_block`
 /// so the caller can report network cost.
@@ -217,11 +227,19 @@ async fn scan_forward_for_inclusion(
     target_epoch: u64,
     committee_map: &HashMap<(u64, u64), Vec<u64>>,
     block_fetches: &mut u32,
-) -> Result<Option<(u64, u32)>> {
+) -> Result<Option<(super::AttestationInclusion, u32)>> {
     // EIP-7045: inclusion must happen by target_epoch+1.
     let last_slot = chain::epoch_start_slot(target_epoch + 2) - 1;
     let probe_set: HashSet<u64> = std::iter::once(duty.validator_index).collect();
     let mut missed_before = 0u32;
+    let target_root = root_at_or_before(client, chain::epoch_start_slot(target_epoch)).await?;
+    let head_root = root_at_or_before(client, duty.slot).await?;
+    let context = super::VoteContext {
+        block_roots: HashMap::from([(duty.slot, head_root)]),
+        target_root,
+        target_epoch,
+        source: None,
+    };
 
     for slot in (duty.slot + 1)..=last_slot {
         let (block_opt, _) = client.get_block(slot).await?;
@@ -244,12 +262,12 @@ async fn scan_forward_for_inclusion(
             target_epoch,
             committee_map,
             &probe_set,
-            /* ctx */ None,
+            Some(&context),
             &mut inclusions,
         )?;
 
-        if inclusions.contains_key(&duty.validator_index) {
-            return Ok(Some((slot, missed_before)));
+        if let Some(inc) = inclusions.remove(&duty.validator_index) {
+            return Ok(Some((inc, missed_before)));
         }
         tracing::trace!(
             validator = duty.validator_index,
@@ -260,6 +278,21 @@ async fn scan_forward_for_inclusion(
     }
 
     Ok(None)
+}
+
+/// A skipped duty/boundary votes for the preceding block, never a zero root.
+async fn root_at_or_before(
+    client: &BeaconClient,
+    slot: u64,
+) -> Result<crate::beacon_client::types::BlockRoot> {
+    for prior in (slot.saturating_sub(chain::slots_per_epoch() * 2)..=slot).rev() {
+        if let (Some(root), _) = client.get_block_root(prior).await? {
+            return Ok(root);
+        }
+    }
+    Err(crate::error::Error::BeaconDataUnavailable(format!(
+        "No canonical root at or before slot {slot}"
+    )))
 }
 
 #[cfg(test)]

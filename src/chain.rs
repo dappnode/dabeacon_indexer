@@ -11,7 +11,6 @@
 //! so pure-logic unit tests work without network access.
 
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Every chain parameter the indexer reads at some point. Kept deliberately
 /// small — add fields only when an actual call site needs them.
@@ -96,15 +95,6 @@ pub fn epoch_start_slot(epoch: u64) -> u64 {
 
 pub fn slot_to_epoch(slot: u64) -> u64 {
     slot / slots_per_epoch()
-}
-
-/// Slot implied by the local wall clock. Callers should still prefer beacon
-/// data for canonical chain state, but this prevents rendering duties whose
-/// assigned time has not arrived when a node reports slightly ahead.
-pub fn current_slot() -> Option<u64> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    now.checked_sub(spec().genesis_time)
-        .map(|elapsed| elapsed / spec().seconds_per_slot)
 }
 
 /// Epoch E may include attestations through the end of E+1. Checkpoint E+2

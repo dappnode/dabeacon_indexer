@@ -21,13 +21,14 @@ pub struct LiveSseQuery {
     pub api_key: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct AttestationOutcome {
     pub validator_index: u64,
     pub included: Option<bool>,
+    pub inclusion_slot: Option<u64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct LiveSlot {
     pub slot: u64,
     pub block: bool,
@@ -44,7 +45,7 @@ pub struct LiveSlot {
     pub sync: Vec<Option<bool>>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct LiveUpdate {
     pub epoch: u64,
     pub previous_epoch: Option<u64>,
@@ -77,37 +78,27 @@ pub async fn live_sse(
 
     // Refresh on every broadcast event, on lag, and at least every 6s. Close
     // the stream only when the broadcaster drops.
-    let stream = stream::unfold(
-        (true, receiver, None::<LiveUpdate>),
-        move |(first, mut rx, last)| {
-            let app_state = app_state.clone();
-            async move {
-                if !first
-                    && let Ok(Err(broadcast::error::RecvError::Closed)) =
-                        tokio::time::timeout(Duration::from_secs(6), rx.recv()).await
-                {
-                    return None;
-                }
-                let (event, next_last) = match build_live_update(&app_state).await {
-                    Ok(data) => {
-                        let next_last = Some(data.clone());
-                        (Event::default().json_data(data).unwrap(), next_last)
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Live UI refresh failed; retaining last complete payload");
-                        match last.clone() {
-                            Some(data) => {
-                                let next_last = Some(data.clone());
-                                (Event::default().json_data(data).unwrap(), next_last)
-                            }
-                            None => (Event::default().comment("live data pending"), None),
-                        }
-                    }
-                };
-                Some((Ok(event), (false, rx, next_last)))
+    let stream = stream::unfold((true, receiver), move |(first, mut rx)| {
+        let app_state = app_state.clone();
+        async move {
+            if !first
+                && let Ok(Err(broadcast::error::RecvError::Closed)) =
+                    tokio::time::timeout(Duration::from_secs(6), rx.recv()).await
+            {
+                return None;
             }
-        },
-    );
+            let event = match build_live_update(&app_state).await {
+                Ok(data) => Event::default().json_data(data).unwrap(),
+                Err(error) => {
+                    tracing::warn!(%error, "Live UI refresh failed; retaining last complete payload");
+                    // SSE comments keep the connection alive without replacing
+                    // the browser's data or falsely refreshing its timestamp.
+                    Event::default().comment("live data pending")
+                }
+            };
+            Some((Ok(event), (false, rx)))
+        }
+    });
     Ok(Sse::new(stream))
 }
 
@@ -184,8 +175,13 @@ async fn build_live_update(state: &AppState) -> anyhow::Result<LiveUpdate> {
             .map(|d| AttestationOutcome {
                 validator_index: d.validator_index,
                 included: resolve_included(
-                    attestation_status.get(&(slot, d.validator_index)).copied(),
+                    attestation_status
+                        .get(&(slot, d.validator_index))
+                        .map(|&(included, known, _)| (included, known)),
                 ),
+                inclusion_slot: attestation_status
+                    .get(&(slot, d.validator_index))
+                    .and_then(|&(_, _, inclusion)| inclusion),
             })
             .collect();
 

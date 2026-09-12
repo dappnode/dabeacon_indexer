@@ -4,7 +4,6 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::chain;
 use crate::db::api::attestations as db_att;
 use crate::db::api::attestations::AttestationDutyRow;
 use crate::web::AppState;
@@ -57,17 +56,11 @@ pub(super) async fn get_attestations(
         .as_ref()
         .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect());
 
-    let beacon_head = state.beacon_client.get_head_slot().await.ok();
-    let observed_head = match (beacon_head, chain::current_slot()) {
-        (Some(beacon), Some(wall_clock)) => Some(beacon.min(wall_clock)),
-        (Some(beacon), None) => Some(beacon),
-        (None, wall_clock) => wall_clock,
-    };
     let filter = db_att::AttestationFilter {
         validator_indices,
         epoch_from: f.epoch_from,
         epoch_to: f.epoch_to,
-        assigned_slot_to: observed_head.map(|slot| slot as i64),
+        processed_only: true,
         included: f.included,
         head_correct: f.head_correct,
         target_correct: f.target_correct,

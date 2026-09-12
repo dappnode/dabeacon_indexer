@@ -10,6 +10,45 @@ use crate::error::Result;
 /// (validator_index, epoch, source_reward, target_reward, head_reward, inactivity_penalty)
 pub type RewardTuple = (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
 
+pub struct InclusionDetails {
+    pub slot: i64,
+    pub delay: i32,
+    pub effective_delay: i32,
+    pub source_correct: bool,
+    pub target_correct: bool,
+    pub head_correct: bool,
+}
+
+/// Called only after proving the inclusion block belongs to finalized ancestry.
+/// Repair derived fields without replacing rewards or accepting a later duplicate.
+pub async fn repair_finalized_inclusion(
+    pool: &Pool,
+    validator: i64,
+    epoch: i64,
+    details: &InclusionDetails,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE attestation_duties SET inclusion_slot=$3,inclusion_delay=$4,
+         effective_inclusion_delay=$5,source_correct=$6,target_correct=$7,head_correct=$8
+         WHERE validator_index=$1 AND epoch=$2 AND included AND inclusion_slot >= $3
+           AND (NOT EXISTS (SELECT 1 FROM completed_scans c
+               WHERE c.validator_index=$1 AND c.epoch=$2)
+               OR (inclusion_slot=$3 AND (effective_inclusion_delay IS NULL
+                   OR source_correct IS NULL OR target_correct IS NULL OR head_correct IS NULL)))",
+    )
+    .bind(validator)
+    .bind(epoch)
+    .bind(details.slot)
+    .bind(details.delay)
+    .bind(details.effective_delay)
+    .bind(details.source_correct)
+    .bind(details.target_correct)
+    .bind(details.head_correct)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Batch-update reward columns on non-finalized attestation_duties rows.
 /// Used by the epoch-transition eager reward fetch to fill in rewards on rows
 /// the head tracker already wrote (whose `ON CONFLICT` upsert would reject a
@@ -45,9 +84,9 @@ pub async fn update_attestation_rewards_batch(pool: &Pool, rewards: &[RewardTupl
             target_reward = v.target_reward,
             head_reward = v.head_reward,
             inactivity_penalty = v.inactivity_penalty,
-            source_correct = CASE WHEN v.source_reward > 0 THEN TRUE ELSE ad.source_correct END,
-            target_correct = CASE WHEN v.target_reward > 0 THEN TRUE ELSE ad.target_correct END,
-            head_correct = CASE WHEN v.head_reward > 0 THEN TRUE ELSE ad.head_correct END
+            source_correct = COALESCE(ad.source_correct, CASE WHEN v.source_reward > 0 THEN TRUE END),
+            target_correct = COALESCE(ad.target_correct, CASE WHEN v.target_reward > 0 THEN TRUE END),
+            head_correct = COALESCE(ad.head_correct, CASE WHEN v.head_reward > 0 THEN TRUE END)
         FROM UNNEST($1::BIGINT[], $2::BIGINT[], $3::BIGINT[], $4::BIGINT[], $5::BIGINT[], $6::BIGINT[])
             AS v(validator_index, epoch, source_reward, target_reward, head_reward, inactivity_penalty)
         WHERE ad.validator_index = v.validator_index
@@ -124,6 +163,8 @@ pub async fn upsert_attestation_duty(
              EXCLUDED.finalized = TRUE
              OR attestation_duties.inclusion_slot IS NULL
              OR EXCLUDED.inclusion_slot < attestation_duties.inclusion_slot
+             OR (EXCLUDED.inclusion_slot = attestation_duties.inclusion_slot
+                 AND EXCLUDED.effective_inclusion_delay IS NOT NULL)
            ))
           -- Path 2: an incomplete finalized scan can be repaired.
           -- Only finalized writes (archive backfill) are allowed here.
@@ -238,6 +279,89 @@ pub async fn count_covered_validator_epochs(
 #[cfg(test)]
 mod live_join_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn finalized_detail_repair_preserves_rewards_and_earliest_inclusion() {
+        let pool = crate::db::isolated_test_pool().await;
+        let validator = 99102;
+        let epoch = 20;
+        super::super::validators::upsert_validator(&pool, validator, &[10], 0, None)
+            .await
+            .unwrap();
+        write(&pool, validator, epoch, Some(644)).await;
+        update_attestation_rewards_batch(
+            &pool,
+            &[(validator, epoch, Some(10), Some(20), Some(0), Some(0))],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE attestation_duties SET finalized=TRUE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut details = InclusionDetails {
+            slot: 643,
+            delay: 2,
+            effective_delay: 1,
+            source_correct: true,
+            target_correct: true,
+            head_correct: true,
+        };
+        repair_finalized_inclusion(&pool, validator, epoch, &details)
+            .await
+            .unwrap();
+        details.slot = 645;
+        details.head_correct = false;
+        repair_finalized_inclusion(&pool, validator, epoch, &details)
+            .await
+            .unwrap();
+        let row: (i64, i32, bool, i64, bool) = sqlx::query_as(
+            "SELECT inclusion_slot,effective_inclusion_delay,head_correct,head_reward,finalized FROM attestation_duties"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (643, 1, true, 0, true));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn processed_list_omits_seeds_and_keeps_confirmed_misses() {
+        use crate::db::api::attestations::{
+            AttestationFilter, AttestationSort, SortOrder, list_attestation_duties_paginated,
+        };
+        let pool = crate::db::isolated_test_pool().await;
+        super::super::validators::upsert_validator(&pool, 99103, &[11], 0, None)
+            .await
+            .unwrap();
+        write(&pool, 99103, 20, None).await;
+        write(&pool, 99103, 19, Some(610)).await;
+        write(&pool, 99103, 18, None).await;
+        sqlx::query("UPDATE attestation_duties SET inclusion_known=TRUE WHERE epoch=18")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (rows, total) = list_attestation_duties_paginated(
+            &pool,
+            &AttestationFilter {
+                processed_only: true,
+                ..Default::default()
+            },
+            AttestationSort::Epoch,
+            SortOrder::Desc,
+            50,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.epoch, r.included))
+                .collect::<Vec<_>>(),
+            vec![(19, Some(true)), (18, Some(false))]
+        );
+        pool.close().await;
+    }
 
     #[tokio::test]
     #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]

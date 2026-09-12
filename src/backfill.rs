@@ -21,6 +21,9 @@ use crate::error::{Error, Result};
 use crate::live_updates::LiveUpdateEvent;
 use crate::scanner;
 
+mod retry;
+pub use retry::HistoricalRetry;
+
 /// Repair persisted live gaps after startup as well as historical catch-up.
 /// Recent gaps get a small independent budget so unavailable old history does
 /// not prevent repair of data an ordinary node can still serve.
@@ -80,16 +83,13 @@ pub fn earliest_epoch_to_scan(
 ///
 /// - `Ok(true)`: node returned the state (archival-capable at this depth, or
 ///   the epoch is within a non-archive node's retention window).
-/// - `Ok(false)`: node returned 404 — the state has been pruned, so backfill
-///   at this epoch will fail.
-/// - `Err`: transport / non-404 API error. The caller decides whether to
-///   treat this as fatal or just "proceed and let the real run fail loudly."
+/// - `Ok(false)`: node returned 404 — the state is unavailable, possibly pruned.
+/// - `Err`: transport / non-404 API error.
+///
+/// A successful probe only verifies this state query, not every scan input.
 pub async fn probe_archival_capability(client: &BeaconClient, epoch: u64) -> Result<bool> {
-    // The rewards/duties APIs for epoch N internally need the state at the
-    // epoch N→N+1 boundary — NOT just the start-of-epoch state. For epoch 0
-    // the genesis state (slot 0) is always retained, but slot 32+ (epoch 1
-    // start) may be pruned. Probe at epoch 1 when asked about epoch 0 to
-    // avoid a false positive.
+    // Genesis may be retained even when other historical states are not.
+    // Probe epoch 1 when asked about epoch 0 to avoid that false positive.
     let probe_epoch = epoch.max(1);
     let state_id = (probe_epoch * chain::slots_per_epoch()).to_string();
     match client.get_finality_checkpoints(&state_id).await {
@@ -125,7 +125,7 @@ pub async fn run_backfill(
     let mut non_contiguous_pending = config.non_contiguous_backfill;
     let mut target_finalized_epoch = initial_target_epoch;
     let scan_mode = config.scan_mode.resolve(validator_scan_state.len());
-    tracing::info!(
+    tracing::debug!(
         scan_mode = ?scan_mode,
         validator_count = validator_scan_state.len(),
         "Backfill resolved attestation scan mode"
@@ -145,7 +145,7 @@ pub async fn run_backfill(
     loop {
         let this_pass_non_contiguous = non_contiguous_pending;
         crate::metrics::BACKFILL_TARGET_EPOCH.set(target_finalized_epoch as i64);
-        tracing::info!(
+        tracing::debug!(
             target_finalized_epoch,
             non_contiguous = this_pass_non_contiguous,
             "Starting backfill pass"
@@ -177,7 +177,7 @@ pub async fn run_backfill(
 
         crate::metrics::BACKFILL_MIN_START.set(min_start as i64);
         let total_epochs = target_finalized_epoch - min_start + 1;
-        tracing::info!(
+        tracing::debug!(
             from = min_start,
             to = target_finalized_epoch,
             total_epochs,
@@ -230,13 +230,9 @@ pub async fn run_backfill(
 
             scanner::scan_epoch(client, pool, epoch, &scan_validators, true, scan_mode)
                 .await
-                .map_err(|e| {
-                    tracing::error!(
-                        epoch,
-                        error = %e,
-                        "Backfill epoch scan failed; aborting to prevent inconsistent data"
-                    );
-                    e
+                .map_err(|source| Error::BackfillEpoch {
+                    epoch,
+                    source: Box::new(source),
                 })?;
 
             // GREATEST semantics on the DB watermark mean a non-contiguous pass

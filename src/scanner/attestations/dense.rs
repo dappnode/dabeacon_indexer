@@ -267,8 +267,7 @@ async fn build_vote_context(
         block_roots,
         target_root,
         target_epoch: epoch,
-        source_epoch: checkpoints.current_justified.epoch,
-        source_root: checkpoints.current_justified.root,
+        source: Some(checkpoints.current_justified),
     })
 }
 

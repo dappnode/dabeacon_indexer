@@ -3,6 +3,7 @@
 //! prevent reuse after restart. Raw JSON retains endpoint metadata verbatim.
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use std::time::{Duration, Instant};
 
 use super::BeaconClient;
 use super::types::{BeaconResponse, Root};
@@ -46,16 +47,22 @@ impl BeaconClient {
         loop {
             match self.get_header(&slot.to_string()).await {
                 Ok(header) => return Ok((slot, header.data.root)),
-                Err(Error::BeaconApi { status: 404, .. }) if slot > 0 => slot -= 1,
+                Err(Error::BeaconApi { status: 404, .. }) => {
+                    if slot == 0 {
+                        break;
+                    }
+                    slot -= 1;
+                }
                 Err(error) => return Err(error),
             }
             // Do not turn a long unavailable range into an unbounded request loop.
             if boundary - slot > crate::chain::slots_per_epoch() * 2 {
-                return Err(Error::InconsistentBeaconData(
-                    "input anchor unavailable".into(),
-                ));
+                break;
             }
         }
+        Err(Error::BeaconDataUnavailable(format!(
+            "no input anchor at or before epoch {epoch} (slot {boundary}); history may be pruned"
+        )))
     }
 
     async fn anchor_unchanged(&self, input: &CachedInput) -> Result<bool> {
@@ -114,11 +121,39 @@ impl BeaconClient {
                 return Ok(parsed);
             }
         }
+        // Many inclusion slots need the same epoch input. Share a short retry
+        // delay so a pruned state is not requested once per slot on every poll.
+        if let Some((since, message)) = self.unavailable_inputs.lock().await.peek(&key)
+            && since.elapsed() < Duration::from_secs(30)
+        {
+            return Err(Error::BeaconApi {
+                status: 404,
+                message: message.clone(),
+            });
+        }
         let (anchor_slot, anchor_root) = self.input_anchor(epoch).await?;
-        let response: serde_json::Value = match body {
-            Some(_) => self.post_response(path, &indices).await?.json().await?,
-            None => self.get_response(path).await?.json().await?,
+        let fetched = match body {
+            Some(_) => self.post_response(path, &indices).await,
+            None => self.get_input_response(epoch, path).await,
         };
+        let response: serde_json::Value = match fetched {
+            Ok(response) => response.json().await?,
+            Err(Error::BeaconApi {
+                status: 404,
+                message,
+            }) => {
+                self.unavailable_inputs
+                    .lock()
+                    .await
+                    .put(key, (Instant::now(), message.clone()));
+                return Err(Error::BeaconApi {
+                    status: 404,
+                    message,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        self.unavailable_inputs.lock().await.pop(&key);
         let parsed: BeaconResponse<T> = serde_json::from_value(response.clone())?;
         parsed.ensure_not_optimistic()?;
         if let Some(dependency) = &parsed.dependent_root {
@@ -153,6 +188,41 @@ impl BeaconClient {
         }
         self.input_cache.write().await.put(key, input);
         Ok(parsed)
+    }
+
+    async fn get_input_response(&self, epoch: u64, path: &str) -> Result<reqwest::Response> {
+        let result = self.get_response(path).await;
+        // Committee assignment for the current/previous epoch can be obtained
+        // from a recent state even when the exact epoch-boundary state is pruned.
+        // Keep the stable epoch cache key and all normal anchor/optimism checks.
+        if matches!(result, Err(Error::BeaconApi { status: 404, .. }))
+            && path
+                == format!(
+                    "/eth/v1/beacon/states/{}/committees?epoch={epoch}",
+                    epoch_start_slot(epoch)
+                )
+        {
+            let head = self.get_head_header().await?;
+            let head_epoch = crate::chain::slot_to_epoch(head.header.message.slot);
+            if epoch >= head_epoch.saturating_sub(1) && epoch <= head_epoch {
+                let response = self
+                    .get_response(&format!(
+                        "/eth/v1/beacon/states/{}/committees?epoch={epoch}",
+                        head.header.message.state_root
+                    ))
+                    .await?;
+                let after = self
+                    .get_header(&head.header.message.slot.to_string())
+                    .await?;
+                if after.data.root != head.root || !after.data.canonical {
+                    return Err(Error::InconsistentBeaconData(
+                        "Committee fallback branch changed".into(),
+                    ));
+                }
+                return Ok(response);
+            }
+        }
+        result
     }
 }
 
@@ -252,6 +322,127 @@ mod tests {
             .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn committee_fallback_is_recent_pinned_and_cached() {
+        use axum::{extract::Request, response::IntoResponse};
+        let state = MockState::default();
+        let app_state = state.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let state = app_state.clone();
+            async move {
+                let path = request.uri().path();
+                if path.starts_with("/eth/v1/beacon/headers/") {
+                    let Json(mut response) = header(State(state)).await;
+                    let id = path.rsplit('/').next().unwrap();
+                    response["data"]["header"]["message"]["slot"] =
+                        if id == "head" { "96" } else { id }.into();
+                    return Json(response).into_response();
+                }
+                if path.contains("/states/0x") {
+                    state.requests.fetch_add(1, Ordering::SeqCst);
+                    // Simulate a branch switch while fetching the pinned state.
+                    if state.pruned.load(Ordering::SeqCst) {
+                        state.reorg.store(true, Ordering::SeqCst);
+                    }
+                    return Json(serde_json::json!({"execution_optimistic":false,
+                        "data":[{"index":"0","slot":"64","validators":["42"]}]}))
+                    .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BeaconClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(client.get_committees(2).await.unwrap()[0].slot, 64);
+        client.get_committees(2).await.unwrap();
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        // An old archive request must not silently use the head's committee set.
+        assert!(matches!(
+            client.get_committees(1).await,
+            Err(Error::BeaconApi { status: 404, .. })
+        ));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        client.invalidate_duty_caches().await;
+        state.pruned.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            client.get_committees(2).await,
+            Err(Error::InconsistentBeaconData(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_inputs_share_retry_delay_and_recover_after_expiry() {
+        let state = MockState::default();
+        state.pruned.store(true, Ordering::SeqCst);
+        let app = Router::new()
+            .route("/eth/v1/beacon/headers/{id}", get(header))
+            .route("/eth/v1/validator/duties/proposer/1", get(duties))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BeaconClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for _ in 0..12 {
+            assert!(matches!(
+                client.get_proposer_duties(1).await,
+                Err(Error::BeaconApi { status: 404, .. })
+            ));
+        }
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        state.pruned.store(false, Ordering::SeqCst);
+        for (_, (since, _)) in client.unavailable_inputs.lock().await.iter_mut() {
+            *since = Instant::now() - Duration::from_secs(31);
+        }
+        assert!(client.get_proposer_duties(1).await.is_ok());
+        assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_anchor_is_unavailable_and_search_is_bounded() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new()
+            .route(
+                "/eth/v1/beacon/headers/head",
+                get(|| async {
+                    let Json(mut response) = header(State(MockState::default())).await;
+                    response["data"]["header"]["message"]["slot"] = "320".into();
+                    Json(response)
+                }),
+            )
+            .route(
+                "/eth/v1/beacon/headers/{id}",
+                get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::NOT_FOUND }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BeaconClient::new(&format!("http://{address}"));
+        assert!(matches!(
+            client.input_anchor(3).await,
+            Err(Error::BeaconDataUnavailable(_))
+        ));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            (crate::chain::slots_per_epoch() * 2 + 1) as usize
+        );
+        // A missing genesis anchor has the same classification, with no underflow.
+        assert!(matches!(
+            client.input_anchor(0).await,
+            Err(Error::BeaconDataUnavailable(_))
+        ));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            (crate::chain::slots_per_epoch() * 2 + 2) as usize
+        );
+        server.abort();
     }
 
     #[tokio::test]

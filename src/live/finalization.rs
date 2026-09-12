@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::beacon_client::BeaconClient;
 use crate::beacon_client::types::{BlockRoot, FinalizedCheckpointEvent};
@@ -12,6 +12,7 @@ pub(super) async fn finalize_collected_evidence(
     client: &BeaconClient,
     pool: &PgPool,
     finalized: &FinalizedCheckpointEvent,
+    resolved: &super::head::ResolvedChain,
 ) -> Result<()> {
     let timer = crate::metrics::LIVE_FINALIZED_RESCAN_DURATION
         .with_label_values(&["promote_collected"])
@@ -45,6 +46,38 @@ pub(super) async fn finalize_collected_evidence(
     // Validators removed from the current config can still have provisional
     // evidence collected in an earlier run. Finish that evidence too.
     let indices = live::tracked_validators(pool).await?;
+    // Filled vote/delay fields were derived from these same chain roots, so
+    // confirming ancestry confirms them too. Re-decode only missing details
+    // from earlier versions/partial collection, with a small per-poll budget.
+    let repair_slots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT a.inclusion_slot FROM attestation_duties a
+         JOIN live_blocks b ON b.slot=a.inclusion_slot
+         WHERE a.included AND b.root=ANY($1)
+           AND b.slot >= $2
+           AND (a.effective_inclusion_delay IS NULL
+                OR a.head_correct IS NULL OR a.target_correct IS NULL OR a.source_correct IS NULL)
+         ORDER BY a.inclusion_slot DESC LIMIT 4",
+    )
+    .bind(&roots)
+    .bind(resolved.blocks.keys().min().copied().unwrap_or(u64::MAX) as i64)
+    .fetch_all(pool)
+    .await?;
+    let tracked: HashSet<u64> = indices.iter().map(|v| *v as u64).collect();
+    for slot in repair_slots {
+        if let Some(block) = resolved.blocks.get(&(slot as u64))
+            && let Err(error) = crate::scanner::scan_live_attestations_in_slot(
+                client,
+                pool,
+                &tracked,
+                block,
+                &resolved.roots,
+                true,
+            )
+            .await
+        {
+            tracing::debug!(slot, %error, "Finalized attestation details pending repair");
+        }
+    }
     let completed =
         promote_collected(pool, &indices, target, finalized.epoch, floor, &roots).await?;
     tracing::debug!(
@@ -97,9 +130,9 @@ async fn promote_collected(
         "UPDATE attestation_duties a SET
         source_reward=(r->>'source')::BIGINT,target_reward=(r->>'target')::BIGINT,
         head_reward=(r->>'head')::BIGINT,inactivity_penalty=(r->>'inactivity')::BIGINT,
-        source_correct=CASE WHEN (r->>'source')::BIGINT > 0 THEN TRUE ELSE a.source_correct END,
-        target_correct=CASE WHEN (r->>'target')::BIGINT > 0 THEN TRUE ELSE a.target_correct END,
-        head_correct=CASE WHEN (r->>'head')::BIGINT > 0 THEN TRUE ELSE a.head_correct END
+        source_correct=COALESCE(a.source_correct, CASE WHEN (r->>'source')::BIGINT > 0 THEN TRUE END),
+        target_correct=COALESCE(a.target_correct, CASE WHEN (r->>'target')::BIGINT > 0 THEN TRUE END),
+        head_correct=COALESCE(a.head_correct, CASE WHEN (r->>'head')::BIGINT > 0 THEN TRUE END)
         FROM live_jobs j CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(j.payload->'total_rewards') r
         WHERE j.component='attestation_rewards' AND j.status='complete'
           AND j.dependency=ANY($1) AND j.validator_index=ANY($2) AND j.epoch<=$3
@@ -226,6 +259,8 @@ async fn promote_collected(
     let ready: Vec<(i64,i64)> = sqlx::query_as("SELECT a.validator_index,a.epoch
         FROM attestation_duties a WHERE a.validator_index=ANY($1) AND a.epoch<=$2
           AND a.epoch*$3 >= $4 AND a.inclusion_known
+          AND (NOT a.included OR (a.effective_inclusion_delay IS NOT NULL
+               AND a.source_correct IS NOT NULL AND a.target_correct IS NOT NULL AND a.head_correct IS NOT NULL))
           AND a.source_reward IS NOT NULL AND a.target_reward IS NOT NULL AND a.head_reward IS NOT NULL
           AND (SELECT COUNT(*) FROM live_coverage c WHERE c.validator_index=a.validator_index
                AND c.slot >= a.epoch*$3 AND c.slot < (a.epoch+2)*$3) = 2*$3
@@ -362,9 +397,9 @@ mod tests {
             Some((start + 1) as i64),
             Some(1),
             Some(1),
-            None,
-            None,
-            None,
+            Some(true),
+            Some(true),
+            Some(false),
             None,
             None,
             None,
@@ -438,6 +473,33 @@ mod tests {
         live::record_coverage(&pool, &[validator], end - 1)
             .await
             .unwrap();
+        sqlx::query("UPDATE attestation_duties SET head_correct=NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Even full coverage/rewards cannot complete an included row whose
+        // vote comparison is still missing. Zero reward does not fill it.
+        assert_eq!(
+            promote_collected(&pool, &[validator], epoch, epoch + 2, start, &roots)
+                .await
+                .unwrap(),
+            0
+        );
+        attestations::repair_finalized_inclusion(
+            &pool,
+            validator,
+            epoch as i64,
+            &attestations::InclusionDetails {
+                slot: (start + 1) as i64,
+                delay: 1,
+                effective_delay: 1,
+                source_correct: true,
+                target_correct: true,
+                head_correct: false,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             promote_collected(&pool, &[validator], epoch, epoch + 2, start, &roots)
                 .await

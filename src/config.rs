@@ -10,7 +10,7 @@ pub enum ScanMode {
     /// Fetch every block in the epoch + late window; derive correctness from
     /// attestations vs the canonical chain. Amortises well for 30+ validators.
     Dense,
-    /// Scan forward per duty and use positive rewards as vote-correct evidence.
+    /// Scan forward per duty and compare included votes with canonical roots.
     /// Zero rewards still require inclusion discovery. Best for small scan sets.
     Sparse,
     /// Resolve at startup based on validator count. Default.

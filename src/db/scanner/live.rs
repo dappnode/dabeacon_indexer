@@ -135,11 +135,21 @@ pub async fn missing_coverage_slots(
     end: u64,
     limit: i64,
 ) -> Result<Vec<u64>> {
-    let slots: Vec<i64> = sqlx::query_scalar("SELECT s FROM GENERATE_SERIES($2::BIGINT,$3::BIGINT) s
-        WHERE (SELECT COUNT(*) FROM live_coverage c WHERE c.slot=s AND c.validator_index=ANY($1)) < $4
-        ORDER BY s DESC LIMIT $5")
-        .bind(validators).bind(start as i64).bind(end as i64).bind(validators.len() as i64)
-        .bind(limit).fetch_all(pool).await?;
+    let slots: Vec<i64> = sqlx::query_scalar(
+        "SELECT s FROM GENERATE_SERIES($2::BIGINT,$3::BIGINT) s
+        WHERE s >= COALESCE((SELECT MIN(started_epoch)*$6 FROM live_tracking_start
+                  WHERE validator_index=ANY($1)), $2)
+        AND (SELECT COUNT(*) FROM live_coverage c WHERE c.slot=s AND c.validator_index=ANY($1)) < $4
+        ORDER BY s DESC LIMIT $5",
+    )
+    .bind(validators)
+    .bind(start as i64)
+    .bind(end as i64)
+    .bind(validators.len() as i64)
+    .bind(limit)
+    .bind(crate::chain::slots_per_epoch() as i64)
+    .fetch_all(pool)
+    .await?;
     Ok(slots.into_iter().map(|s| s as u64).collect())
 }
 
@@ -252,23 +262,25 @@ pub async fn fail_job(pool: &Pool, job: &LiveJob, error: &str) -> Result<()> {
 }
 
 pub async fn expire_jobs(pool: &Pool, min_epoch: u64) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO live_gaps(validator_index,epoch,reason)
-         SELECT validator_index,epoch,'reward retry window expired' FROM live_jobs
+         SELECT DISTINCT validator_index,epoch,'reward retry window expired' FROM live_jobs
          WHERE epoch < $1 AND status='pending'
          ON CONFLICT(validator_index,epoch) DO UPDATE SET
            reason=EXCLUDED.reason,updated_at=NOW()",
     )
     .bind(min_epoch as i64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let retired = sqlx::query(
         "UPDATE live_jobs SET status='needs_backfill' WHERE epoch < $1 AND status='pending'",
     )
     .bind(min_epoch as i64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     crate::metrics::LIVE_EPOCHS_INCOMPLETE.inc_by(retired);
     Ok(())
 }
@@ -331,6 +343,51 @@ pub async fn report_progress(pool: &Pool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn expiring_multiple_components_and_slots_creates_one_gap_per_epoch() {
+        let pool = crate::db::isolated_test_pool().await;
+        super::super::validators::upsert_validator(&pool, 1, &[1], 0, None)
+            .await
+            .unwrap();
+        enqueue_jobs(&pool, 20, None, "attestation_rewards", &[1], None)
+            .await
+            .unwrap();
+        for slot in [640, 641] {
+            enqueue_jobs(&pool, 20, Some(slot), "sync_rewards", &[1], None)
+                .await
+                .unwrap();
+        }
+        enqueue_jobs(&pool, 21, None, "attestation_rewards", &[1], None)
+            .await
+            .unwrap();
+        // Updating an existing gap must be safe too.
+        sqlx::query(
+            "INSERT INTO live_gaps(validator_index,epoch,reason) VALUES(1,20,'incomplete')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        expire_jobs(&pool, 21).await.unwrap();
+        expire_jobs(&pool, 21).await.unwrap();
+        let gaps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_gaps WHERE epoch=20")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(gaps, 1);
+        let states: Vec<(i64, String, i64)> = sqlx::query_as(
+            "SELECT epoch,status,COUNT(*) FROM live_jobs GROUP BY epoch,status ORDER BY epoch",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![(20, "needs_backfill".into(), 3), (21, "pending".into(), 1)]
+        );
+        pool.close().await;
+    }
 
     #[tokio::test]
     #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
@@ -397,30 +454,41 @@ mod tests {
                 (21, "needs_backfill".into(), false)
             ]
         );
-        record_coverage(&pool, &[1], 100).await.unwrap();
-        record_coverage(&pool, &[1], 102).await.unwrap();
+        record_coverage(&pool, &[1], 640).await.unwrap();
+        record_coverage(&pool, &[1], 642).await.unwrap();
         record_block(
             &pool,
-            102,
+            642,
             &root,
             &BlockRoot::parse(&format!("0x{}", "02".repeat(32))).unwrap(),
         )
         .await
         .unwrap();
-        let presence = crate::db::api::live::fetch_block_presence(&pool, &[1], 100, 103)
+        let presence = crate::db::api::live::fetch_block_presence(&pool, &[1], 640, 643)
             .await
             .unwrap();
-        assert_eq!(presence.get(&100), Some(&false));
-        assert_eq!(presence.get(&101), None);
-        assert_eq!(presence.get(&102), Some(&true));
+        assert_eq!(presence.get(&640), Some(&false));
+        assert_eq!(presence.get(&641), None);
+        assert_eq!(presence.get(&642), Some(&true));
+        // A block fetched before an input failure is still known to exist;
+        // publishing its presence must not imply complete duty coverage.
+        let partial_root = BlockRoot::parse(&format!("0x{}", "02".repeat(32))).unwrap();
+        let parent_root = BlockRoot::parse(&format!("0x{}", "03".repeat(32))).unwrap();
+        record_block(&pool, 641, &partial_root, &parent_root)
+            .await
+            .unwrap();
+        let partial_presence = crate::db::api::live::fetch_block_presence(&pool, &[1], 640, 643)
+            .await
+            .unwrap();
+        assert_eq!(partial_presence.get(&641), Some(&true));
         assert_eq!(
-            missing_coverage_slots(&pool, &[1], 100, 102, 12)
+            missing_coverage_slots(&pool, &[1], 608, 642, 12)
                 .await
                 .unwrap(),
-            vec![101]
+            vec![641]
         );
-        assert_eq!(processed_tip(&pool, &[1]).await.unwrap(), Some(102));
-        invalidate_from(&pool, 96).await.unwrap();
+        assert_eq!(processed_tip(&pool, &[1]).await.unwrap(), Some(642));
+        invalidate_from(&pool, 640).await.unwrap();
         assert_eq!(processed_tip(&pool, &[1]).await.unwrap(), None);
         pool.close().await;
     }

@@ -18,12 +18,12 @@ pub(super) async fn process_head_scan(
     client: &BeaconClient,
     pool: &PgPool,
     scan_validators: &HashSet<u64>,
-    head: &HeadEvent,
     last_scanned_slot: &mut Option<u64>,
     resolved: &ResolvedChain,
-    target_slot: u64,
+    collection_range: std::ops::RangeInclusive<u64>,
 ) -> Result<()> {
     let scan_started_at = std::time::Instant::now();
+    let target_slot = *collection_range.end();
     let start = last_scanned_slot.map_or(0, |slot| slot.saturating_add(1));
     let indices: Vec<i64> = scan_validators.iter().map(|v| *v as i64).collect();
     let mut slots: Vec<u64> = if start <= target_slot {
@@ -31,7 +31,15 @@ pub(super) async fn process_head_scan(
     } else {
         Vec::new()
     };
-    let resolved_start = resolved.blocks.keys().min().copied().unwrap_or(start);
+    // The older root context is for vote comparisons, not a request to start
+    // collecting backwards beyond the configured recovery window.
+    let resolved_start = resolved
+        .blocks
+        .keys()
+        .min()
+        .copied()
+        .unwrap_or(start)
+        .max(*collection_range.start());
     slots.extend(
         db_scanner::live::missing_coverage_slots(pool, &indices, resolved_start, target_slot, 12)
             .await?,
@@ -43,14 +51,26 @@ pub(super) async fn process_head_scan(
     slots.truncate(32);
     let mut duties_by_epoch = HashMap::new();
     let mut active_by_epoch = HashMap::new();
+    let mut first_error: Option<crate::error::Error> = None;
     for &slot in &slots {
         let epoch = slot_to_epoch(slot);
         if let std::collections::hash_map::Entry::Vacant(entry) = duties_by_epoch.entry(epoch) {
-            let duties = fetch_epoch_duties(client, pool, &indices, slot, slot).await;
-            if let Err(error) = &duties {
-                tracing::warn!(epoch, %error, "Epoch assignments unavailable; preserving coverage gap");
-            }
-            entry.insert(duties.ok());
+            let duties = match fetch_epoch_duties(client, pool, &indices, slot, slot).await {
+                Ok(duties) => Some(duties),
+                Err(error) => {
+                    tracing::debug!(epoch, %error, "Epoch assignments unavailable; preserving coverage gap");
+                    if first_error.is_none()
+                        || (first_error
+                            .as_ref()
+                            .is_some_and(crate::error::Error::is_unavailable_input)
+                            && !error.is_unavailable_input())
+                    {
+                        first_error = Some(error);
+                    }
+                    None
+                }
+            };
+            entry.insert(duties);
             let mut active =
                 db_scanner::validators::active_validators_at(pool, &indices, epoch as i64).await?;
             if epoch > 0 {
@@ -88,16 +108,23 @@ pub(super) async fn process_head_scan(
                     .with_label_values(&["processed"])
                     .set(slot as i64);
             }
-            Err(error) => tracing::warn!(slot, %error, "Live slot incomplete; retained for retry"),
+            Err(error) => {
+                tracing::debug!(slot, %error, "Live slot incomplete; retained for retry");
+                if first_error.is_none()
+                    || (first_error
+                        .as_ref()
+                        .is_some_and(crate::error::Error::is_unavailable_input)
+                        && !error.is_unavailable_input())
+                {
+                    first_error = Some(error);
+                }
+            }
         }
     }
-    crate::metrics::LIVE_LAST_SLOT
-        .with_label_values(&["head_event"])
-        .set(head.slot as i64);
     crate::metrics::LIVE_HEAD_SCAN_DURATION
         .with_label_values(&["total"])
         .observe(scan_started_at.elapsed().as_secs_f64());
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn process_slot(
@@ -149,10 +176,18 @@ async fn process_slot(
     if let Some(block) = block
         && !active.is_empty()
     {
-        scanner::scan_live_attestations_in_slot(client, pool, slot, active, Some(block)).await?;
+        scanner::scan_live_attestations_in_slot(
+            client,
+            pool,
+            active,
+            block,
+            &resolved.roots,
+            false,
+        )
+        .await?;
     }
     if !duties.complete {
-        return Err(crate::error::Error::InconsistentBeaconData(
+        return Err(crate::error::Error::BeaconDataUnavailable(
             "Assignments incomplete; retaining slot coverage gap".into(),
         ));
     }
@@ -196,6 +231,9 @@ async fn fetch_epoch_duties(
         if let Err(error) =
             scanner::seed_live_attestation_duties(client, pool, epoch, &active).await
         {
+            if !error.is_unavailable_input() {
+                return Err(error);
+            }
             tracing::debug!(epoch, %error, "Attestation assignments pending");
             complete = false;
         }
@@ -209,6 +247,9 @@ async fn fetch_epoch_duties(
                 }
             }
             Err(error) => {
+                if !error.is_unavailable_input() {
+                    return Err(error);
+                }
                 complete = false;
                 tracing::debug!(epoch, %error, "Proposer assignments pending");
             }
@@ -231,6 +272,9 @@ async fn fetch_epoch_duties(
                     sync_positions_by_epoch.insert(epoch, positions);
                 }
                 Err(error) => {
+                    if !error.is_unavailable_input() {
+                        return Err(error);
+                    }
                     complete = false;
                     tracing::debug!(epoch, %error, "Sync assignments pending");
                 }

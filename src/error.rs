@@ -25,11 +25,32 @@ pub enum Error {
     #[error("Invalid beacon block id: {0}")]
     InvalidBlockId(String),
 
+    /// Required history could not be retrieved. This does not establish that
+    /// the node returned contradictory data (it may have pruned the history).
+    #[error("Beacon data unavailable: {0}")]
+    BeaconDataUnavailable(String),
+
+    #[error("Backfill epoch {epoch}: {source}")]
+    BackfillEpoch {
+        epoch: u64,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// Spec-level invariant violated by data from the beacon node (malformed
     /// SSZ, mismatched length, missing required entry). Fatal to the current
     /// scan so we don't persist inconsistent rows.
     #[error("Inconsistent beacon data: {0}")]
     InconsistentBeaconData(String),
+}
+
+impl Error {
+    pub fn is_unavailable_input(&self) -> bool {
+        matches!(
+            self,
+            Self::BeaconDataUnavailable(_) | Self::BeaconApi { status: 404, .. }
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

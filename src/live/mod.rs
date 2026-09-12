@@ -63,6 +63,7 @@ pub async fn run_live_tracking(
     let worker = async {
         let indices: Vec<i64> = tracked.iter().map(|v| *v as i64).collect();
         let mut cursor = db_scanner::live::processed_tip(pool, &indices).await?;
+        let mut last_error = None;
         let mut timer = tokio::time::interval(Duration::from_secs(config.poll_interval_seconds));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -70,8 +71,13 @@ pub async fn run_live_tracking(
                 _ = timer.tick() => {},
                 changed = wake_rx.changed() => { if changed.is_err() { return Ok(()); } }
             }
-            if let Err(error) = reconcile(client, pool, tracked, &config, &mut cursor).await {
-                tracing::warn!(%error, "Live reconciliation incomplete; retrying on next event or poll");
+            match reconcile(client, pool, tracked, &config, &mut cursor).await {
+                Ok(()) => {
+                    if last_error.take().is_some() {
+                        tracing::info!("Live reconciliation recovered");
+                    }
+                }
+                Err(error) => report_reconciliation_failure(&mut last_error, &error),
             }
             let _ = live_updates_tx.send(LiveUpdateEvent::LiveHeadProcessed);
             if let Err(error) = db_scanner::instance::update_heartbeat(pool, instance_id).await {
@@ -83,6 +89,24 @@ pub async fn run_live_tracking(
         result = worker => result,
         () = receive_events(url, wake_tx) => Ok(()),
     }
+}
+
+fn report_reconciliation_failure(last_error: &mut Option<String>, error: &Error) {
+    let message = error.to_string();
+    if last_error.as_ref() == Some(&message) {
+        tracing::debug!(%error, "Live reconciliation still incomplete; retry pending");
+        return;
+    }
+    match error {
+        Error::BeaconDataUnavailable(_) | Error::BeaconApi { status: 404, .. } => {
+            tracing::info!(%error, "Live inputs unavailable; collecting available data and retaining gaps for retry");
+        }
+        Error::Database(_) | Error::InconsistentBeaconData(_) | Error::Json(_) => {
+            tracing::error!(%error, "Live reconciliation incomplete; retry pending");
+        }
+        _ => tracing::warn!(%error, "Live reconciliation incomplete; retry pending"),
+    }
+    *last_error = Some(message);
 }
 
 fn collection_start(head_slot: u64, cursor: Option<u64>, window_epochs: u64) -> u64 {
@@ -107,6 +131,9 @@ async fn reconcile(
         epoch_transition: false,
     };
     let target = head.slot.saturating_sub(config.lag_slots);
+    crate::metrics::LIVE_LAST_SLOT
+        .with_label_values(&["head_event"])
+        .set(head.slot as i64);
     let epoch = slot_to_epoch(head.slot);
     let indices: Vec<i64> = tracked.iter().map(|v| *v as i64).collect();
     db_scanner::live::register_tracking_start(pool, &indices, epoch).await?;
@@ -128,6 +155,9 @@ async fn reconcile(
     let walk_start = stored
         .first()
         .map_or(start, |(slot, _, _)| start.min(*slot));
+    // Inclusion in E may contain votes from E-1. Keep that epoch's boundary
+    // and predecessor root for head/target comparisons, even across skipped slots.
+    let walk_start = epoch_start_slot(slot_to_epoch(walk_start).saturating_sub(1));
     let resolved = head::resolve_chain(client, &head, walk_start.min(target)).await?;
 
     if let Some((changed, _, _)) = stored
@@ -162,15 +192,12 @@ async fn reconcile(
         tracing::debug!(duty_epoch = epoch, %error, "Duty prefetch pending");
     }
     let scan_result =
-        head::process_head_scan(client, pool, tracked, &head, cursor, &resolved, target).await;
+        head::process_head_scan(client, pool, tracked, cursor, &resolved, floor..=target).await;
     // A branch switch during collection invalidates everything written in this
     // attempt before rewards or finalization can observe it as complete.
     if !canonical_root(client, head.slot, &head.block).await? {
         reorg::rollback(client, pool, walk_start, cursor).await?;
         return Ok(());
-    }
-    if let Err(error) = scan_result {
-        tracing::warn!(%error, "Recent slot collection pending");
     }
 
     let min_epoch = epoch.saturating_sub(config.retry_window_epochs);
@@ -216,12 +243,13 @@ async fn reconcile(
         block: finality.data.finalized.root,
         epoch: finality.data.finalized.epoch,
     };
-    finalization::finalize_collected_evidence(client, pool, &finalized).await?;
+    finalization::finalize_collected_evidence(client, pool, &finalized, &resolved).await?;
     let retain_epoch = min_epoch.min(finalized.epoch.saturating_sub(2));
     db_scanner::live::prune_completed_evidence(pool, retain_epoch).await?;
     client.prune_inputs_before(retain_epoch).await?;
     db_scanner::live::report_progress(pool).await?;
-    Ok(())
+    // Report collection failures after independent reward/finality work runs.
+    scan_result
 }
 
 /// Attestation rewards for E need the end-of-E+1 state. Apply the same

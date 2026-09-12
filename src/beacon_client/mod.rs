@@ -46,6 +46,7 @@ pub struct BeaconClient {
     pub(crate) head_slot_cache: RwLock<Option<(u64, Instant)>>,
     pub(crate) head_finality_cache: RwLock<Option<(FinalityCheckpoints, Instant)>>,
     input_cache: RwLock<LruCache<String, inputs::CachedInput>>,
+    unavailable_inputs: Mutex<LruCache<String, (Instant, String)>>,
     input_pool: Option<sqlx::PgPool>,
 }
 
@@ -80,6 +81,7 @@ impl BeaconClient {
             head_slot_cache: RwLock::new(None),
             head_finality_cache: RwLock::new(None),
             input_cache: RwLock::new(LruCache::new(nz(INPUT_CACHE_CAPACITY))),
+            unavailable_inputs: Mutex::new(LruCache::new(nz(INPUT_CACHE_CAPACITY))),
             input_pool: None,
         }
     }
@@ -89,6 +91,7 @@ impl BeaconClient {
     /// pre-reorg duties out of cache.
     pub async fn invalidate_duty_caches(&self) {
         self.input_cache.write().await.clear();
+        self.unavailable_inputs.lock().await.clear();
         *self.head_slot_cache.write().await = None;
         *self.head_finality_cache.write().await = None;
     }

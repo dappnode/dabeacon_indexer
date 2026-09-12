@@ -288,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
     let backfill_fut = async {
         if matches!(config.mode, RunMode::Both) {
             let mut historical_done = !backfill_should_run;
+            let mut historical_retry = backfill::HistoricalRetry::default();
             let tracked: Vec<i64> = tracked_set.iter().map(|v| *v as i64).collect();
             loop {
                 // Repair recent persisted gaps even if much older history is unavailable.
@@ -309,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(error) => tracing::debug!(%error,"Cannot refresh archive repair target"),
                 }
-                if !historical_done {
+                if !historical_done && historical_retry.ready(std::time::Instant::now()) {
                     match backfill::run_backfill(
                         &backfill_client,
                         &pool,
@@ -324,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         Ok(()) => historical_done = true,
                         Err(error) => {
-                            tracing::warn!(%error,"Historical backfill unavailable; live collection continues")
+                            historical_retry.failed(&error, std::time::Instant::now());
                         }
                     }
                 }

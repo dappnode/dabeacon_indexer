@@ -2,8 +2,7 @@
 //!
 //! Both the dense epoch pipeline and the live inclusion scan enter through
 //! [`extract_attestation_inclusions`]. Vote correctness is computed only when
-//! a `VoteContext` is supplied; live paths pass `None` and accept default-false
-//! `VoteMarks`.
+//! a `VoteContext` is supplied. Both live and dense scans supply chain roots.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +31,9 @@ pub(super) fn compute_vote_correctness<'a>(
         head_correct: &data.beacon_block_root == canonical_head_root,
         target_correct: data.target.epoch == ctx.target_epoch
             && data.target.root == ctx.target_root,
-        source_correct: data.source.epoch == ctx.source_epoch
-            && data.source.root == ctx.source_root,
+        source_correct: ctx.source.as_ref().is_none_or(|source| {
+            data.source.epoch == source.epoch && data.source.root == source.root
+        }),
     };
     Ok((canonical_head_root, marks))
 }
@@ -279,6 +279,17 @@ fn process_resolved_attestation(
     inclusions: &mut HashMap<u64, AttestationInclusion>,
 ) -> Result<()> {
     let delay = inclusion_delay(inclusion_slot, data.slot)?;
+    if !committees.iter().any(|assigned| {
+        assigned
+            .validators
+            .iter()
+            .enumerate()
+            .any(|(position, validator)| {
+                scan_set.contains(validator) && agg_bits[assigned.bit_offset + position]
+            })
+    }) {
+        return Ok(());
+    }
     let (canonical_head_root, marks) = match ctx {
         Some(ctx) => {
             let (root, marks) = compute_vote_correctness(data, ctx)?;
@@ -405,8 +416,10 @@ mod tests {
             block_roots,
             target_root: target,
             target_epoch: 3,
-            source_epoch: 2,
-            source_root: source,
+            source: Some(crate::beacon_client::types::Checkpoint {
+                epoch: 2,
+                root: source,
+            }),
         }
     }
 
