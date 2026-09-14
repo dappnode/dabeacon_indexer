@@ -98,9 +98,9 @@
 			<div class="flex items-center h-14 gap-3">
 				<a href="/" class="flex items-center gap-2 shrink-0 group" onclick={closeMobileMenu}>
 					<img
-						src="/dappnode-logo-only.png"
-						alt="DAppNode"
-						class="w-7 h-7 shrink-0 transition group-hover:opacity-90"
+						src="/beacon-indexer-icon.png"
+						alt="Beacon Indexer"
+						class="w-7 h-7 shrink-0 rounded-lg transition group-hover:opacity-90"
 					/>
 					<span class="text-lg font-bold tracking-tight bg-gradient-to-r from-blue-300 via-sky-300 to-cyan-300 bg-clip-text text-transparent">Beacon Indexer</span>
 				</a>
