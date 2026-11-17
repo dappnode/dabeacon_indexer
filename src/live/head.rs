@@ -18,44 +18,26 @@ pub(super) async fn process_head_scan(
     client: &BeaconClient,
     pool: &PgPool,
     scan_validators: &HashSet<u64>,
-    last_scanned_slot: &mut Option<u64>,
     resolved: &ResolvedChain,
     collection_range: std::ops::RangeInclusive<u64>,
 ) -> Result<()> {
     let scan_started_at = std::time::Instant::now();
-    let target_slot = *collection_range.end();
-    let start = last_scanned_slot.map_or(0, |slot| slot.saturating_add(1));
     let indices: Vec<i64> = scan_validators.iter().map(|v| *v as i64).collect();
-    let mut slots: Vec<u64> = if start <= target_slot {
-        (start..=target_slot).collect()
-    } else {
-        Vec::new()
-    };
-    // The older root context is for vote comparisons, not a request to start
-    // collecting backwards beyond the configured recovery window.
-    let resolved_start = resolved
-        .blocks
-        .keys()
-        .min()
-        .copied()
-        .unwrap_or(start)
-        .max(*collection_range.start());
-    slots.extend(
-        db_scanner::live::missing_coverage_slots(pool, &indices, resolved_start, target_slot, 12)
-            .await?,
-    );
-    slots.sort_unstable();
-    slots.dedup();
-    // A stale gap must not consume the state-retention window for new blocks.
-    slots.reverse();
-    slots.truncate(32);
+    let slots = db_scanner::live::missing_coverage_slots(
+        pool,
+        &indices,
+        *collection_range.start(),
+        *collection_range.end(),
+        32,
+    )
+    .await?;
     let mut duties_by_epoch = HashMap::new();
     let mut active_by_epoch = HashMap::new();
     let mut first_error: Option<crate::error::Error> = None;
     for &slot in &slots {
         let epoch = slot_to_epoch(slot);
         if let std::collections::hash_map::Entry::Vacant(entry) = duties_by_epoch.entry(epoch) {
-            let duties = match fetch_epoch_duties(client, pool, &indices, slot, slot).await {
+            let duties = match fetch_epoch_duties(client, pool, &indices, epoch).await {
                 Ok(duties) => Some(duties),
                 Err(error) => {
                     tracing::debug!(epoch, %error, "Epoch assignments unavailable; preserving coverage gap");
@@ -103,7 +85,6 @@ pub(super) async fn process_head_scan(
         .await;
         match result {
             Ok(()) => {
-                *last_scanned_slot = Some(last_scanned_slot.map_or(slot, |last| last.max(slot)));
                 crate::metrics::LIVE_LAST_SLOT
                     .with_label_values(&["processed"])
                     .set(slot as i64);
@@ -138,12 +119,6 @@ async fn process_slot(
 ) -> Result<()> {
     let block = resolved.blocks.get(&slot);
     let epoch = slot_to_epoch(slot);
-    if let Some(block) = block {
-        // Save ancestry before any outcome; even a partially failed scan must
-        // remain identifiable and removable if its branch is later orphaned.
-        let root = &resolved.roots[&slot];
-        db_scanner::live::record_block(pool, slot, root, block.parent_root()).await?;
-    }
     if let Some(&proposer) = duties.proposer_by_slot.get(&slot) {
         scanner::upsert_live_proposal_in_slot(pool, slot, proposer, block).await?;
         if block.is_some() {
@@ -158,7 +133,7 @@ async fn process_slot(
             .await?;
         }
     }
-    if let Some(positions) = duties.sync_positions_by_epoch.get(&epoch) {
+    if let Some(positions) = &duties.sync_positions {
         scanner::upsert_live_sync_in_slot(pool, slot, block, positions).await?;
         if block.is_some_and(|block| block.sync_aggregate().is_some()) {
             let members: Vec<i64> = positions.keys().map(|v| *v as i64).collect();
@@ -199,66 +174,55 @@ struct EpochDuties {
     complete: bool,
     /// slot -> validator_index for tracked validators scheduled to propose.
     proposer_by_slot: HashMap<u64, u64>,
-    /// epoch -> (validator_index -> sync-committee positions).
-    sync_positions_by_epoch: HashMap<u64, HashMap<u64, Vec<u64>>>,
+    /// validator_index -> sync-committee positions, absent before Altair.
+    sync_positions: Option<HashMap<u64, Vec<u64>>>,
 }
 
 async fn fetch_epoch_duties(
     client: &BeaconClient,
     pool: &PgPool,
     tracked_indices: &[i64],
-    scan_start_slot: u64,
-    head_slot: u64,
+    epoch: u64,
 ) -> Result<EpochDuties> {
-    let mut epochs: Vec<u64> = (scan_start_slot..=head_slot)
-        .filter(|&s| s > 0)
-        .map(slot_to_epoch)
-        .collect();
-    epochs.sort_unstable();
-    epochs.dedup();
-
-    let mut complete = true;
-    let mut proposer_by_slot: HashMap<u64, u64> = HashMap::new();
-    let mut sync_positions_by_epoch: HashMap<u64, HashMap<u64, Vec<u64>>> = HashMap::new();
-
-    for epoch in epochs {
-        let active =
-            db_scanner::validators::active_validators_at(pool, tracked_indices, epoch as i64)
-                .await?;
-        if active.is_empty() {
-            continue;
+    let mut duties = EpochDuties {
+        complete: true,
+        proposer_by_slot: HashMap::new(),
+        sync_positions: None,
+    };
+    let active =
+        db_scanner::validators::active_validators_at(pool, tracked_indices, epoch as i64).await?;
+    if active.is_empty() {
+        return Ok(duties);
+    }
+    if let Err(error) = scanner::seed_live_attestation_duties(client, pool, epoch, &active).await {
+        if !error.is_unavailable_input() {
+            return Err(error);
         }
-        if let Err(error) =
-            scanner::seed_live_attestation_duties(client, pool, epoch, &active).await
-        {
+        tracing::debug!(epoch, %error, "Attestation assignments pending");
+        duties.complete = false;
+    }
+    match client.get_proposer_duties(epoch).await {
+        Ok(proposers) => {
+            duties.proposer_by_slot = proposers
+                .into_iter()
+                .filter(|duty| active.contains(&duty.validator_index))
+                .map(|duty| (duty.slot, duty.validator_index))
+                .collect();
+        }
+        Err(error) => {
             if !error.is_unavailable_input() {
                 return Err(error);
             }
-            tracing::debug!(epoch, %error, "Attestation assignments pending");
-            complete = false;
+            duties.complete = false;
+            tracing::debug!(epoch, %error, "Proposer assignments pending");
         }
+    }
+    if epoch >= crate::chain::altair_epoch() {
         let active_indices: Vec<u64> = active.iter().copied().collect();
-        match client.get_proposer_duties(epoch).await {
-            Ok(duties) => {
-                for duty in duties {
-                    if active.contains(&duty.validator_index) {
-                        proposer_by_slot.insert(duty.slot, duty.validator_index);
-                    }
-                }
-            }
-            Err(error) => {
-                if !error.is_unavailable_input() {
-                    return Err(error);
-                }
-                complete = false;
-                tracing::debug!(epoch, %error, "Proposer assignments pending");
-            }
-        }
-        if epoch >= crate::chain::altair_epoch() {
-            match client.get_sync_duties(epoch, &active_indices).await {
-                Ok(duties) => {
-                    let positions = duties
-                        .into_iter()
+        match client.get_sync_duties(epoch, &active_indices).await {
+            Ok(sync) => {
+                duties.sync_positions = Some(
+                    sync.into_iter()
                         .map(|duty| {
                             (
                                 duty.validator_index,
@@ -268,25 +232,19 @@ async fn fetch_epoch_duties(
                                     .collect(),
                             )
                         })
-                        .collect();
-                    sync_positions_by_epoch.insert(epoch, positions);
+                        .collect(),
+                );
+            }
+            Err(error) => {
+                if !error.is_unavailable_input() {
+                    return Err(error);
                 }
-                Err(error) => {
-                    if !error.is_unavailable_input() {
-                        return Err(error);
-                    }
-                    complete = false;
-                    tracing::debug!(epoch, %error, "Sync assignments pending");
-                }
+                duties.complete = false;
+                tracing::debug!(epoch, %error, "Sync assignments pending");
             }
         }
     }
-
-    Ok(EpochDuties {
-        complete,
-        proposer_by_slot,
-        sync_positions_by_epoch,
-    })
+    Ok(duties)
 }
 
 /// Every missing slot in this range is proven by an actual parent link.
@@ -354,6 +312,59 @@ mod tests {
     use super::*;
     use axum::{Json, Router, extract::Request, http::StatusCode, response::IntoResponse};
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn full_live_walk_remains_cached_across_polls_and_new_heads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let router = Router::new().fallback(move |req: Request| {
+            let counter = counter.clone();
+            async move {
+                let Some(root) = req.uri().path().strip_prefix("/eth/v2/beacon/blocks/0x") else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let slot = u64::from_str_radix(root, 16).unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut block: Value =
+                    serde_json::from_str(include_str!("../../testdata/blocks/phase0.json"))
+                        .unwrap();
+                block["data"]["message"]["slot"] = json!(slot.to_string());
+                block["data"]["message"]["parent_root"] = json!(format!("0x{:064x}", slot - 1));
+                block["finalized"] = json!(false);
+                Json(block).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BeaconClient::new(&format!("http://{}", listener.local_addr().unwrap()))
+            .with_live_block_cache(4);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        // The longest default walk is 192 blocks, larger than the historical
+        // cache of 128. Its epoch floor advances when the next epoch starts.
+        let start = crate::chain::epoch_start_slot(5);
+        let slot = crate::chain::epoch_start_slot(11) - 1;
+        let mut head = HeadEvent {
+            slot,
+            block: BlockRoot::parse(&format!("0x{slot:064x}")).unwrap(),
+            epoch_transition: false,
+        };
+        let first = resolve_chain(&client, &head, start).await.unwrap();
+        let initial_requests = requests.load(Ordering::SeqCst);
+        assert!(initial_requests > 128);
+        assert_eq!(initial_requests, first.blocks.len());
+        resolve_chain(&client, &head, start).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), initial_requests);
+        head.slot += 1;
+        head.block = BlockRoot::parse(&format!("0x{:064x}", head.slot)).unwrap();
+        resolve_chain(&client, &head, start + crate::chain::slots_per_epoch())
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), initial_requests + 1);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn parent_root_gap_never_imports_competing_slot_block() {

@@ -54,8 +54,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let pool = db::connect(&config.database_url).await?;
-    let live_client =
-        Arc::new(beacon_client::BeaconClient::new(&config.beacon_url).with_pool(pool.clone()));
+    let live_client = beacon_client::BeaconClient::new(&config.beacon_url).with_pool(pool.clone());
 
     // Load chain config from the live node before anything else touches the
     // `chain::` accessors (scanner pipeline, backfill probe, web-SSE handler).
@@ -74,20 +73,23 @@ async fn main() -> anyhow::Result<()> {
         "Loaded chain spec from beacon node"
     );
     chain::init(chain_spec);
+    let live_client = Arc::new(live_client.with_live_block_cache(config.live.retry_window_epochs));
     anyhow::ensure!(
         config.live.lag_slots < chain::epoch_start_slot(config.live.retry_window_epochs),
         "live lag must fit inside retry window"
     );
 
-    // Separate client for backfill when a dedicated URL is configured (typical:
-    // archive node for backfill, non-archive for live). Otherwise share.
-    let backfill_client = match &config.backfill_beacon_url {
-        Some(url) => {
-            tracing::info!(url, "Using separate beacon client for backfill");
-            Arc::new(beacon_client::BeaconClient::new(url))
-        }
-        None => live_client.clone(),
-    };
+    // Independent caches keep historical scans and the live ancestry walk
+    // from evicting each other's blocks, even when they use the same node.
+    let backfill_url = config
+        .backfill_beacon_url
+        .as_deref()
+        .unwrap_or(&config.beacon_url);
+    let backfill_client = Arc::new(beacon_client::BeaconClient::new(backfill_url));
+    tracing::info!(
+        url = backfill_url,
+        "Using independent beacon client for backfill"
+    );
     let instance_id = Uuid::new_v4();
     let tracked_validators = Arc::new(validator_indices.clone());
     let (live_updates_tx, _) = broadcast::channel::<LiveUpdateEvent>(512);

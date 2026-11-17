@@ -61,8 +61,6 @@ pub async fn run_live_tracking(
     let (wake_tx, mut wake_rx) = watch::channel(0);
     // Both futures are scoped to this invocation; cancellation drops the SSE reader too.
     let worker = async {
-        let indices: Vec<i64> = tracked.iter().map(|v| *v as i64).collect();
-        let mut cursor = db_scanner::live::processed_tip(pool, &indices).await?;
         let mut last_error = None;
         let mut timer = tokio::time::interval(Duration::from_secs(config.poll_interval_seconds));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -71,7 +69,7 @@ pub async fn run_live_tracking(
                 _ = timer.tick() => {},
                 changed = wake_rx.changed() => { if changed.is_err() { return Ok(()); } }
             }
-            match reconcile(client, pool, tracked, &config, &mut cursor).await {
+            match reconcile(client, pool, tracked, &config).await {
                 Ok(()) => {
                     if last_error.take().is_some() {
                         tracing::info!("Live reconciliation recovered");
@@ -109,19 +107,11 @@ fn report_reconciliation_failure(last_error: &mut Option<String>, error: &Error)
     *last_error = Some(message);
 }
 
-fn collection_start(head_slot: u64, cursor: Option<u64>, window_epochs: u64) -> u64 {
-    let floor = epoch_start_slot(slot_to_epoch(head_slot).saturating_sub(window_epochs));
-    cursor.map_or(epoch_start_slot(slot_to_epoch(head_slot)), |slot| {
-        slot.saturating_add(1).max(floor)
-    })
-}
-
 async fn reconcile(
     client: &BeaconClient,
     pool: &PgPool,
     tracked: &HashSet<u64>,
     config: &LiveConfig,
-    cursor: &mut Option<u64>,
 ) -> Result<()> {
     let header = client.get_head_header().await?;
     let head_state_root = header.header.message.state_root.clone();
@@ -138,45 +128,49 @@ async fn reconcile(
     let indices: Vec<i64> = tracked.iter().map(|v| *v as i64).collect();
     db_scanner::live::register_tracking_start(pool, &indices, epoch).await?;
     let floor = epoch_start_slot(epoch.saturating_sub(config.retry_window_epochs));
-    if cursor.is_some_and(|last| last < floor) {
-        // An outage beyond the retry window must not pin collection to pruned
-        // state. Check the old branch independently, then start a recent range.
-        let old = db_scanner::live::recent_blocks(pool, 0).await?;
-        if let Some((_, tip, _)) = old.last()
-            && client.get_header(tip.as_str()).await.is_err()
-            && let Some((first, _, _)) = old.first()
-        {
-            reorg::rollback(client, pool, *first, cursor).await?;
-        }
-        *cursor = None;
-    }
-    let stored = db_scanner::live::recent_blocks(pool, floor).await?;
-    let start = collection_start(head.slot, *cursor, config.retry_window_epochs);
-    let walk_start = stored
-        .first()
-        .map_or(start, |(slot, _, _)| start.min(*slot));
-    // Inclusion in E may contain votes from E-1. Keep that epoch's boundary
-    // and predecessor root for head/target comparisons, even across skipped slots.
-    let walk_start = epoch_start_slot(slot_to_epoch(walk_start).saturating_sub(1));
+    let stored = db_scanner::live::recent_blocks(pool, 0).await?;
+    // Always resolve the retry range and the preceding epoch for vote comparisons.
+    let walk_start =
+        epoch_start_slot(epoch.saturating_sub(config.retry_window_epochs.saturating_add(1)));
     let resolved = head::resolve_chain(client, &head, walk_start.min(target)).await?;
+    let resolved_floor = resolved.blocks.keys().min().copied().unwrap_or(walk_start);
 
-    if let Some((changed, _, _)) = stored
+    // After a long outage the previous tip can be outside the bounded walk.
+    // Only a successful canonical lookup with a different root proves a reorg.
+    // Missing history, transport failures and optimistic responses preserve evidence.
+    if let Some((slot, root, _)) = stored
         .iter()
-        .find(|(slot, root, _)| *slot <= head.slot && resolved.roots.get(slot) != Some(root))
+        .rev()
+        .find(|(slot, _, _)| *slot < resolved_floor)
+        && !canonical_root(client, *slot, root).await?
     {
-        reorg::rollback(client, pool, *changed, cursor).await?;
-        return Ok(()); // Resolve again with the expanded replay range before writing.
+        reorg::rollback(client, pool, stored[0].0).await?;
+        return Ok(());
+    }
+    if let Some((changed, _, _)) = stored.iter().find(|(slot, root, _)| {
+        *slot >= resolved_floor && *slot <= head.slot && resolved.roots.get(slot) != Some(root)
+    }) {
+        reorg::rollback(client, pool, *changed).await?;
+        return Ok(());
     }
     if stored.iter().any(|(slot, _, _)| *slot > head.slot) {
-        reorg::rollback(client, pool, head.slot.saturating_add(1), cursor).await?;
+        reorg::rollback(client, pool, head.slot.saturating_add(1)).await?;
         return Ok(());
     }
 
-    let start = collection_start(head.slot, *cursor, config.retry_window_epochs);
-    if cursor.is_none_or(|last| last.saturating_add(1) < start) {
-        tracing::warn!(start, previous = ?cursor, "Starting recent collection; earlier slots remain incomplete for backfill");
-        *cursor = start.checked_sub(1);
-    }
+    // Ancestry is evidence even when assignments or slot collection fail.
+    let blocks: Vec<_> = resolved
+        .blocks
+        .iter()
+        .map(|(&slot, block)| {
+            (
+                slot,
+                resolved.roots[&slot].clone(),
+                block.parent_root().clone(),
+            )
+        })
+        .collect();
+    db_scanner::live::record_blocks(pool, &blocks).await?;
     // Fetch current assignments before their state can disappear. Future epoch
     // state IDs are legitimately unavailable on ordinary beacon nodes.
     let validators: Vec<u64> = tracked.iter().copied().collect();
@@ -192,11 +186,11 @@ async fn reconcile(
         tracing::debug!(duty_epoch = epoch, %error, "Duty prefetch pending");
     }
     let scan_result =
-        head::process_head_scan(client, pool, tracked, cursor, &resolved, floor..=target).await;
+        head::process_head_scan(client, pool, tracked, &resolved, floor..=target).await;
     // A branch switch during collection invalidates everything written in this
     // attempt before rewards or finalization can observe it as complete.
     if !canonical_root(client, head.slot, &head.block).await? {
-        reorg::rollback(client, pool, walk_start, cursor).await?;
+        reorg::rollback(client, pool, walk_start).await?;
         return Ok(());
     }
 
@@ -369,13 +363,6 @@ async fn collect_job(
 mod tests {
     use super::*;
     #[test]
-    fn lag_preserves_next_unprocessed_slot_and_bounds_old_outages() {
-        assert_eq!(super::collection_start(320, Some(315), 4), 316);
-        assert_eq!(super::collection_start(320, Some(10), 4), 192);
-        assert_eq!(super::collection_start(320, None, 4), 320);
-    }
-
-    #[test]
     fn epoch_rewards_wait_for_imported_slots_after_e_plus_one() {
         let start_e2 = epoch_start_slot(12);
         assert_eq!(latest_reward_epoch(start_e2, 2), Some(9));
@@ -399,6 +386,8 @@ mod tests {
             .unwrap();
         let changed = Arc::new(AtomicBool::new(false));
         let control = changed.clone();
+        let fail_headers = Arc::new(AtomicBool::new(false));
+        let header_control = fail_headers.clone();
         fn root(slot: u64, changed: bool) -> String {
             format!(
                 "0x{:064x}",
@@ -407,9 +396,13 @@ mod tests {
         }
         let app = Router::new().fallback(move |request:Request| {
             let changed = changed.load(Ordering::SeqCst);
+            let fail_headers = fail_headers.load(Ordering::SeqCst);
             async move {
                 let path = request.uri().path();
                 if let Some(id)=path.strip_prefix("/eth/v1/beacon/headers/") {
+                    if fail_headers && id != "head" {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                     let code=if id=="head" {100} else if let Some(hex)=id.strip_prefix("0x") {
                         u64::from_str_radix(hex,16).unwrap()
                     } else {id.parse::<u64>().unwrap()};
@@ -454,38 +447,52 @@ mod tests {
         let client = BeaconClient::new(&format!("http://{}", listener.local_addr().unwrap()))
             .with_pool(pool.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut cursor = None;
         let tracked = HashSet::from([1]);
-        reconcile(
-            &client,
-            &pool,
-            &tracked,
-            &LiveConfig::default(),
-            &mut cursor,
-        )
-        .await
-        .unwrap();
-        assert_eq!(cursor, Some(98));
+        reconcile(&client, &pool, &tracked, &LiveConfig::default())
+            .await
+            .unwrap();
+        assert!(
+            db_scanner::live::missing_coverage_slots(&pool, &[1], 96, 98, 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A transient canonical-header lookup must preserve ancestry and coverage.
+        let before = db_scanner::live::recent_blocks(&pool, 0).await.unwrap();
+        header_control.store(true, Ordering::SeqCst);
+        let short_window = LiveConfig {
+            retry_window_epochs: 0,
+            ..LiveConfig::default()
+        };
+        assert!(
+            reconcile(&client, &pool, &tracked, &short_window)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db_scanner::live::recent_blocks(&pool, 0).await.unwrap(),
+            before
+        );
+        assert!(
+            db_scanner::live::missing_coverage_slots(&pool, &[1], 96, 98, 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        header_control.store(false, Ordering::SeqCst);
         control.store(true, Ordering::SeqCst);
-        reconcile(
-            &client,
-            &pool,
-            &tracked,
-            &LiveConfig::default(),
-            &mut cursor,
-        )
-        .await
-        .unwrap();
-        assert_eq!(cursor, Some(63));
-        reconcile(
-            &client,
-            &pool,
-            &tracked,
-            &LiveConfig::default(),
-            &mut cursor,
-        )
-        .await
-        .unwrap();
+        reconcile(&client, &pool, &tracked, &LiveConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            db_scanner::live::missing_coverage_slots(&pool, &[1], 96, 98, 32)
+                .await
+                .unwrap(),
+            vec![98, 97, 96]
+        );
+        reconcile(&client, &pool, &tracked, &LiveConfig::default())
+            .await
+            .unwrap();
         let roots = db_scanner::live::recent_blocks(&pool, 96).await.unwrap();
         assert!(
             roots
@@ -497,7 +504,33 @@ mod tests {
                 .iter()
                 .any(|(_, value, _)| value.as_str() == root(98, false))
         );
-        assert_eq!(cursor, Some(98));
+        assert!(
+            db_scanner::live::missing_coverage_slots(&pool, &[1], 96, 98, 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Active duties are absent from this fixture: collection fails, but
+        // the entire resolved chain, including the lagged head, stays durable.
+        sqlx::query("UPDATE validators SET activation_epoch=0 WHERE validator_index=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        db_scanner::live::invalidate_from(&pool, 64).await.unwrap();
+        assert!(
+            reconcile(&client, &pool, &tracked, &LiveConfig::default())
+                .await
+                .is_err()
+        );
+        let chain = db_scanner::live::recent_blocks(&pool, 64).await.unwrap();
+        assert_eq!(chain.len(), 37);
+        assert_eq!(chain.last().unwrap().0, 100);
+        assert_eq!(
+            db_scanner::live::missing_coverage_slots(&pool, &[1], 96, 98, 32)
+                .await
+                .unwrap(),
+            vec![98, 97, 96]
+        );
         server.abort();
         pool.close().await;
     }

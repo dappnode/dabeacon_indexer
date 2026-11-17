@@ -4,8 +4,19 @@ use crate::error::Result;
 /// Called only after every stage of a finalized scan has succeeded.
 pub async fn mark_complete(pool: &Pool, validators: &[i64], epoch: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
+    mark_complete_in_transaction(&mut tx, validators, epoch).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Share completion and gap cleanup with live promotion in its existing transaction.
+pub async fn mark_complete_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    validators: &[i64],
+    epoch: i64,
+) -> Result<()> {
     sqlx::query("UPDATE attestation_duties SET inclusion_known=TRUE WHERE validator_index=ANY($1) AND epoch=$2")
-        .bind(validators).bind(epoch).execute(&mut *tx).await?;
+        .bind(validators).bind(epoch).execute(&mut **tx).await?;
     sqlx::query(
         "INSERT INTO completed_scans (validator_index, epoch)
          SELECT UNNEST($1::BIGINT[]), $2
@@ -13,13 +24,12 @@ pub async fn mark_complete(pool: &Pool, validators: &[i64], epoch: i64) -> Resul
     )
     .bind(validators)
     .bind(epoch)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query("DELETE FROM live_gaps WHERE validator_index=ANY($1) AND epoch=$2")
         .bind(validators)
         .bind(epoch)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    tx.commit().await?;
     Ok(())
 }

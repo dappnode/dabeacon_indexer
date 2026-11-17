@@ -99,7 +99,7 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
@@ -140,13 +140,13 @@ jobs:
       VERSION_TAG: ${{ needs.detect-version-change.outputs.version }}
     steps:
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -186,23 +186,23 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact-name: dabeacon_indexer-x86_64-unknown-linux-gnu
 
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact-name: dabeacon_indexer-aarch64-unknown-linux-gnu
 
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact-name: dabeacon_indexer-x86_64-unknown-linux-musl
 
-          - os: macos-14
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             artifact-name: dabeacon_indexer-x86_64-apple-darwin
 
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             artifact-name: dabeacon_indexer-aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -217,32 +217,14 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Install cross-compilation dependencies for Linux targets
-        if: runner.os == 'Linux' && contains(matrix.target, '-unknown-linux-')
-        run: |
-          if [[ "${{ matrix.target }}" == *"-musl" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y musl-tools
-          fi
-          if [[ "${{ matrix.target }}" == "aarch64-"* ]]; then
-            sudo apt-get update
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
-
-      - name: Setup linker for AArch64 Linux
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
-
-      - name: Install common Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
+          sudo apt-get install -y musl-tools
 
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Create release archive
         shell: bash
@@ -292,6 +274,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION_TAG }}
+          target_commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
           name: Release ${{ env.VERSION_TAG }}
           body: |
             ## dabeacon_indexer ${{ env.VERSION_TAG }}
@@ -306,9 +289,9 @@ jobs:
 
             ## Quick Start
             1. Download the binary for your platform
-            2. Extract: `tar -xzf dabeacon_indexer-${{ env.VERSION_TAG }}-<target>.tar.gz`
+            2. Extract: `tar -xzf dabeacon_indexer-<target>-${{ env.VERSION_TAG }}.tar.gz`
             3. Copy and edit config: `cp config.example.toml config.toml`
-            4. Run: `./dabeacon_indexer --config config.toml`
+            4. Run: `./dabeacon_indexer --config-file config.toml`
           files: |
             dabeacon_indexer-*-${{ env.VERSION_TAG }}.tar.gz
           draft: false

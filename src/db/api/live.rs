@@ -15,7 +15,16 @@ pub type SyncStatusMap = HashMap<(u64, u64), (bool, bool)>;
 pub type ProposalStatusMap = HashMap<u64, (u64, bool)>;
 
 pub async fn processed_tip(pool: &Pool, tracked: &[i64]) -> Result<Option<u64>> {
-    crate::db::scanner::live::processed_tip(pool, tracked).await
+    let tip: Option<i64> = sqlx::query_scalar(
+        "SELECT CASE WHEN COUNT(*) = $2 THEN MIN(tip) END
+        FROM (SELECT validator_index, MAX(slot) AS tip FROM live_coverage
+              WHERE validator_index=ANY($1) GROUP BY validator_index) t",
+    )
+    .bind(tracked)
+    .bind(tracked.len() as i64)
+    .fetch_one(pool)
+    .await?;
+    Ok(tip.map(|s| s as u64))
 }
 
 /// A known block remains visible even if its duties are only partly processed.

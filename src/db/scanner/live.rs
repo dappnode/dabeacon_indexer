@@ -67,19 +67,32 @@ pub async fn tracked_validators(pool: &Pool) -> Result<Vec<i64>> {
     .await?)
 }
 
+#[cfg(test)]
 pub async fn record_block(
     pool: &Pool,
     slot: u64,
     root: &BlockRoot,
     parent: &BlockRoot,
 ) -> Result<()> {
+    record_blocks(pool, &[(slot, root.clone(), parent.clone())]).await
+}
+
+/// Store the resolved chain independently of duty coverage in one atomic write.
+pub async fn record_blocks(pool: &Pool, blocks: &[(u64, BlockRoot, BlockRoot)]) -> Result<()> {
+    let slots: Vec<i64> = blocks.iter().map(|(slot, _, _)| *slot as i64).collect();
+    let roots: Vec<&str> = blocks.iter().map(|(_, root, _)| root.as_str()).collect();
+    let parents: Vec<&str> = blocks
+        .iter()
+        .map(|(_, _, parent)| parent.as_str())
+        .collect();
     sqlx::query(
-        "INSERT INTO live_blocks(slot, root, parent_root) VALUES ($1,$2,$3)
-        ON CONFLICT(slot) DO UPDATE SET root=EXCLUDED.root, parent_root=EXCLUDED.parent_root",
+        "INSERT INTO live_blocks(slot,root,parent_root)
+         SELECT * FROM UNNEST($1::BIGINT[],$2::TEXT[],$3::TEXT[])
+         ON CONFLICT(slot) DO UPDATE SET root=EXCLUDED.root,parent_root=EXCLUDED.parent_root",
     )
-    .bind(slot as i64)
-    .bind(root.as_str())
-    .bind(parent.as_str())
+    .bind(slots)
+    .bind(roots)
+    .bind(parents)
     .execute(pool)
     .await?;
     Ok(())
@@ -115,19 +128,6 @@ pub async fn record_coverage(pool: &Pool, validators: &[i64], slot: u64) -> Resu
     Ok(())
 }
 
-pub async fn processed_tip(pool: &Pool, validators: &[i64]) -> Result<Option<u64>> {
-    let tip: Option<i64> = sqlx::query_scalar(
-        "SELECT CASE WHEN COUNT(*) = $2 THEN MIN(tip) END
-        FROM (SELECT validator_index, MAX(slot) AS tip FROM live_coverage
-              WHERE validator_index=ANY($1) GROUP BY validator_index) t",
-    )
-    .bind(validators)
-    .bind(validators.len() as i64)
-    .fetch_one(pool)
-    .await?;
-    Ok(tip.map(|s| s as u64))
-}
-
 pub async fn missing_coverage_slots(
     pool: &Pool,
     validators: &[i64],
@@ -137,15 +137,15 @@ pub async fn missing_coverage_slots(
 ) -> Result<Vec<u64>> {
     let slots: Vec<i64> = sqlx::query_scalar(
         "SELECT s FROM GENERATE_SERIES($2::BIGINT,$3::BIGINT) s
-        WHERE s >= COALESCE((SELECT MIN(started_epoch)*$6 FROM live_tracking_start
-                  WHERE validator_index=ANY($1)), $2)
-        AND (SELECT COUNT(*) FROM live_coverage c WHERE c.slot=s AND c.validator_index=ANY($1)) < $4
-        ORDER BY s DESC LIMIT $5",
+         WHERE EXISTS (SELECT 1 FROM live_tracking_start t
+             WHERE t.validator_index=ANY($1) AND t.started_epoch*$5<=s
+               AND NOT EXISTS (SELECT 1 FROM live_coverage c
+                   WHERE c.validator_index=t.validator_index AND c.slot=s))
+         ORDER BY s DESC LIMIT $4",
     )
     .bind(validators)
     .bind(start as i64)
     .bind(end as i64)
-    .bind(validators.len() as i64)
     .bind(limit)
     .bind(crate::chain::slots_per_epoch() as i64)
     .fetch_all(pool)
@@ -346,6 +346,54 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
+    async fn coverage_scheduling_resumes_gaps_and_respects_each_tracking_start() {
+        let pool = crate::db::isolated_test_pool().await;
+        for validator in [1, 2] {
+            super::super::validators::upsert_validator(
+                &pool,
+                validator,
+                &[validator as u8],
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        register_tracking_start(&pool, &[1], 20).await.unwrap();
+        register_tracking_start(&pool, &[2], 21).await.unwrap();
+        for slot in 640..=674 {
+            if slot != 641 {
+                record_coverage(&pool, &[1], slot).await.unwrap();
+            }
+        }
+        // Adding validator 2 must not reopen its pre-tracking slots.
+        assert_eq!(
+            missing_coverage_slots(&pool, &[1, 2], 630, 674, 32)
+                .await
+                .unwrap(),
+            vec![674, 673, 672, 641]
+        );
+        record_coverage(&pool, &[2], 674).await.unwrap();
+        assert_eq!(
+            missing_coverage_slots(&pool, &[1, 2], 630, 674, 2)
+                .await
+                .unwrap(),
+            vec![673, 672]
+        );
+        // No cursor exists to reconstruct: a fresh query retains the older gap.
+        record_coverage(&pool, &[2], 673).await.unwrap();
+        record_coverage(&pool, &[2], 672).await.unwrap();
+        assert_eq!(
+            missing_coverage_slots(&pool, &[1, 2], 630, 674, 32)
+                .await
+                .unwrap(),
+            vec![641]
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable RECOVERY_TEST_DATABASE_URL"]
     async fn expiring_multiple_components_and_slots_creates_one_gap_per_epoch() {
         let pool = crate::db::isolated_test_pool().await;
         super::super::validators::upsert_validator(&pool, 1, &[1], 0, None)
@@ -487,9 +535,13 @@ mod tests {
                 .unwrap(),
             vec![641]
         );
-        assert_eq!(processed_tip(&pool, &[1]).await.unwrap(), Some(642));
         invalidate_from(&pool, 640).await.unwrap();
-        assert_eq!(processed_tip(&pool, &[1]).await.unwrap(), None);
+        assert_eq!(
+            missing_coverage_slots(&pool, &[1], 640, 642, 32)
+                .await
+                .unwrap(),
+            vec![642, 641, 640]
+        );
         pool.close().await;
     }
 }

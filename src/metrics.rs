@@ -147,7 +147,7 @@ pub static BEACON_REQUEST_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec_with_registry!(
         HistogramOpts::new(
             "beacon_request_duration_seconds",
-            "Wall time per beacon request (success attempts only, incl. body download)."
+            "Time until beacon response headers per HTTP attempt; excludes body download and decoding."
         )
         .buckets(beacon_request_buckets()),
         &["endpoint", "method"],

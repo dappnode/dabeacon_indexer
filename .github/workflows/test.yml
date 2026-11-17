@@ -10,9 +10,36 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  workflows:
+    name: Workflow validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: actionlint
+        run: >-
+          docker run --rm --network none
+          -v "$PWD/.github/workflows:/repo/.github/workflows:ro"
+          -w /repo rhysd/actionlint:1.7.12 -color .github/workflows/*.yml
+
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: recovery_test
+          POSTGRES_USER: recovery_test
+          POSTGRES_PASSWORD: recovery_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recovery_test -d recovery_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -20,19 +47,21 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
-
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --locked --all-targets
 
       - name: cargo test (unit)
-        run: cargo test --bins
+        run: cargo test --locked --bins
+
+      - name: cargo test (database recovery)
+        env:
+          RECOVERY_TEST_DATABASE_URL: postgres://recovery_test:recovery_test@localhost:5432/recovery_test
+        # Recovery tests use isolated schemas and local mock beacon servers.
+        # External beacon equivalence/benchmark tests remain opt-in.
+        run: cargo test --locked --bins -- --ignored --skip scanner::attestations::integration_tests
 
   web:
     name: Web (svelte-check)
@@ -47,7 +76,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
 

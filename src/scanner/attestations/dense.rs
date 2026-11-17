@@ -37,10 +37,18 @@ pub async fn process_epoch_attestation_duties(
     let start_slot = chain::epoch_start_slot(epoch);
     let slots_per_epoch = chain::slots_per_epoch();
 
-    let phase_t = Instant::now();
     let all_slots: Vec<u64> = (start_slot..start_slot + slots_per_epoch * 2).collect();
-    let all_blocks = fetch_blocks_for_slots(client, &all_slots).await?;
-    let blocks_ms = phase_t.elapsed().as_millis() as u64;
+    let scan_validator_indices: Vec<u64> = scan_validators.iter().copied().collect();
+    // Historical inputs are independent. Overlap their full downloads and
+    // decoding instead of adding each endpoint's latency to the epoch scan.
+    let inputs_t = Instant::now();
+    let (all_blocks, committees, attester_duties, att_rewards) = tokio::try_join!(
+        fetch_blocks_for_slots(client, &all_slots),
+        client.get_committees(epoch),
+        client.get_attester_duties(epoch, &scan_validator_indices),
+        client.get_attestation_rewards(epoch, &scan_validator_indices),
+    )?;
+    let inputs_ms = inputs_t.elapsed().as_millis() as u64;
 
     let missed_slots: HashSet<u64> = all_blocks
         .iter()
@@ -60,10 +68,7 @@ pub async fn process_epoch_attestation_duties(
                 }
             });
 
-    let phase_t = Instant::now();
-    let committees = client.get_committees(epoch).await?;
     let committee_map = build_committee_map(&committees);
-    let committees_ms = phase_t.elapsed().as_millis() as u64;
 
     let phase_t = Instant::now();
     let vote_ctx = build_vote_context(client, epoch, start_slot, epoch_blocks).await?;
@@ -82,13 +87,6 @@ pub async fn process_epoch_attestation_duties(
         (result, cpu_t.elapsed().as_millis() as u64)
     });
 
-    let scan_validator_indices: Vec<u64> = scan_validators.iter().copied().collect();
-    let duties_rewards_t = Instant::now();
-    let (attester_duties, att_rewards) = tokio::try_join!(
-        client.get_attester_duties(epoch, &scan_validator_indices),
-        client.get_attestation_rewards(epoch, &scan_validator_indices),
-    )?;
-    let duties_rewards_ms = duties_rewards_t.elapsed().as_millis() as u64;
     let rewards_map: HashMap<u64, ValidatorAttestationReward> = att_rewards
         .total_rewards
         .into_iter()
@@ -126,12 +124,10 @@ pub async fn process_epoch_attestation_duties(
         blocks_present = block_count,
         blocks_missed = missed_count,
         inclusions_found = attestation_inclusions.len(),
-        blocks_ms,
-        committees_ms,
+        inputs_ms,
         vote_ctx_ms,
         inclusions_cpu_ms,
         inclusions_wait_ms,
-        duties_rewards_ms,
         concurrent_ms,
         writes_ms,
         total_ms = total_t.elapsed().as_millis() as u64,

@@ -9,12 +9,10 @@ pub(super) async fn rollback(
     client: &BeaconClient,
     pool: &PgPool,
     first_changed_slot: u64,
-    last_scanned_slot: &mut Option<u64>,
 ) -> Result<()> {
     let replay_from = reorg_replay_start(first_changed_slot);
     scanner::live::invalidate_from(pool, replay_from).await?;
     client.invalidate_duty_caches().await;
-    *last_scanned_slot = replay_from.checked_sub(1);
     crate::metrics::LIVE_REORGS.inc();
     tracing::warn!(
         first_changed_slot,

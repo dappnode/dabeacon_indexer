@@ -8,9 +8,9 @@ COPY web/ ./
 RUN npm run build
 
 # ── Stage 2: Build the Rust binary ──────────────────────────────────────────
-FROM rust:1.96-alpine3.23 AS backend-builder
+FROM rust:1.100-alpine3.23 AS backend-builder
 
-RUN apk add --no-cache musl-dev pkgconf openssl-dev perl make
+RUN apk add --no-cache musl-dev
 
 WORKDIR /app
 
@@ -18,18 +18,18 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 # Build a dummy main so Cargo fetches and compiles deps
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
-    cargo build --release && \
+    cargo build --release --locked && \
     rm -rf src
 
 # Build the real binary
 COPY src/ src/
 COPY migrations/ migrations/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # ── Stage 3: Minimal runtime image ──────────────────────────────────────────
 FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates libssl3 tini
+RUN apk add --no-cache ca-certificates tini
 
 WORKDIR /app
 

@@ -86,6 +86,21 @@ impl BeaconClient {
         }
     }
 
+    /// Keep the full live parent walk: retry epochs, the preceding vote-context
+    /// epoch, the current epoch, and one predecessor across a skipped boundary.
+    /// A smaller LRU refetches the entire walk on every poll.
+    pub fn with_live_block_cache(mut self, retry_window_epochs: u64) -> Self {
+        let slots = retry_window_epochs
+            .saturating_add(2)
+            .saturating_mul(crate::chain::slots_per_epoch())
+            .saturating_add(1);
+        let capacity = usize::try_from(slots).expect("live block cache capacity exceeds usize");
+        self.root_block_cache = Mutex::new(LruCache::new(
+            NonZeroUsize::new(capacity).expect("live block cache capacity is positive"),
+        ));
+        self
+    }
+
     /// Drop all duty/committee + head/finality caches. Called by the live
     /// reorg handler so a reorg crossing an epoch boundary can't serve
     /// pre-reorg duties out of cache.

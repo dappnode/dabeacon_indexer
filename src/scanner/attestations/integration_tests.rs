@@ -454,6 +454,52 @@ async fn dense_vs_sparse_perf_bench() {
     }
 }
 
+/// Profile consecutive dense backfill epochs with production cache reuse.
+/// Writes only to an isolated schema in the disposable recovery database.
+#[tokio::test]
+#[ignore = "requires BEACON_URL, RECOVERY_TEST_DATABASE_URL, TEST_EPOCH, TEST_VALIDATORS"]
+async fn consecutive_backfill_perf_profile() {
+    let beacon_url = env::var("BEACON_URL").unwrap();
+    let epoch: u64 = env::var("TEST_EPOCH").unwrap().parse().unwrap();
+    let validators: HashSet<u64> = env::var("TEST_VALIDATORS")
+        .unwrap()
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let client = BeaconClient::new(&beacon_url);
+    init_chain(&client).await;
+    let pool = db::isolated_test_pool().await;
+    seed_validators(
+        &client,
+        &pool,
+        &validators.iter().copied().collect::<Vec<_>>(),
+    )
+    .await;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("dabeacon_indexer=debug")
+        .with_test_writer()
+        .try_init();
+    for current in epoch..epoch + 3 {
+        let indices: Vec<i64> = validators.iter().map(|v| *v as i64).collect();
+        let active = db::scanner::validators::active_validators_at(&pool, &indices, current as i64)
+            .await
+            .unwrap();
+        let start = Instant::now();
+        crate::scanner::scan_epoch(
+            &client,
+            &pool,
+            current,
+            &active,
+            true,
+            crate::config::EffectiveScanMode::Dense,
+        )
+        .await
+        .unwrap();
+        eprintln!("PROFILE epoch={current} elapsed={:?}", start.elapsed());
+    }
+    pool.close().await;
+}
+
 /// Resolve the sweep sizes. Honours `BENCH_SIZES=1,2,4,8` if set,
 /// otherwise picks powers of two up to `max_size` plus `max_size`
 /// itself if it isn't already a power of two.
